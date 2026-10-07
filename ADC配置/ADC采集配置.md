@@ -136,24 +136,24 @@ ADC 支持四类中断：
 | --- | --- | --- |
 | EOC（规则转换结束） | 一个通道转换完成 | 逐通道读取 |
 | EOS（规则序列结束） | 一轮序列全部转换完成 | 多通道批量读取 |
-| 模拟看门狗 | 输入电压越过预设上/下限（HTR/LTR） | 燃气超标即时报警（见第 7 节） |
+| 模拟看门狗 | 输入电压越过预设上/下限（HTR/LTR） | 燃气超标即时报警（见第 8 节） |
 | 溢出（OVR） | 旧数据未取走就被新结果覆盖 | 程序错误自检 |
 
 转换结束还可以发出 **DMA 请求**，由 DMA 直接把结果从 DR 取走，全程不占用 CPU。**只有 ADC1 和 ADC3 能产生 DMA 请求**（ADC2 的结果要靠"交叉搬运"进 ADC1/ADC3 的通路间接实现），这正是本实验选 ADC1 的原因之一。CubeMX 勾选 *DMA Settings* 后，中断服务函数、DMA 配置全部自动生成，用户只写回调或读缓冲区。
 
 ### 2.8 电压转换
 
-12 位分辨率 = 把 0~3.3V 量程切成 4096 级，每级代表 3.3V/4096 ≈ **0.806mV**——这就是 ADC 能分辨的最小电压变化，也是"12 位精度"的实际含义：比 0.8mV 更小的变化它无法分辨。
+12 位分辨率 = 把 0~3.3V 量程切成 4096 级（码值 0~4095），每级权重 3.3V/4096 ≈ **0.806mV**——这就是 ADC 能分辨的最小电压变化，也是"12 位精度"的实际含义：比 0.8mV 更小的变化它无法分辨。下文换算式取"满量程码值 4095 对应 VREF"的工程惯例（与按级数 4096 计算的差异 <0.03%，可忽略）。
 
-转换结果 X 对应的输入电压：
+转换结果 X 对应的输入电压（与 3.3 节推导步骤 3 相同，满量程码值 4095 对应 VREF）：
 
 ```
-V = 3.3 × X / 4096 (V)
+V = 3.3 × X / 4095 (V)
 ```
 
-> **例子（完整计算链）**：串口打印 `raw=1548` → 引脚电压 = 3.3 × 1548 / 4096 ≈ **1.246V** → 代入 3.3 节的分压公式反推元件电阻 Rs = 5×4.7/1.246 − 9.4 ≈ **9.5kΩ** → 再对照规格书的 Rs—浓度曲线，即可得到气体浓度。
+> **例子（完整计算链）**：串口打印 `raw=1548` → 引脚电压 = 3.3 × 1548 / 4095 ≈ **1.246V** → 代入 3.3 节推导步骤 4 反推元件电阻 Rs = 5×4.7/1.246 − 9.4 ≈ **9.5kΩ** → 再对照规格书的 Rs—浓度曲线，即可得到气体浓度。
 
-验证换算是否正确：用万用表量 PC3/PC4 引脚的实际电压，与 `V = 3.3X/4096` 对账，两者应在几个码值的误差内一致；差得远就先查 VREF 和下拉电阻是否虚焊。
+验证换算是否正确：用万用表量 PC3/PC4 引脚的实际电压，与 `V = 3.3X/4095` 对账，两者应在几个码值的误差内一致；差得远就先查 VREF 和下拉电阻是否虚焊。
 
 ---
 
@@ -226,18 +226,44 @@ VCC_5V ──[Rs 气敏元件]── R1201(4.7kΩ) ──┬── PC3/AIR → �
 
 ![MP503 空气质量传感器接口电路（AirQuality）](MP503空气质量传感器接口电路.png)
 
-**① 分压公式**。以燃气板为例（空气板把 R1207 换成 R1185 即可），气敏元件 Rs 与板载下拉电阻 R下=4.7kΩ 对 5V 分压，串联电阻 R串=4.7kΩ 不流稳态电流（ADC 输入阻抗近似无穷大），所以输出节点电压：
+**① 电压转换公式推导**。以燃气板为例（空气板把 R1207/R1208 换成 R1185/R1201 即可），回路为：`VCC(5V) — 气敏 Rs — R串(R1208=4.7kΩ) —[输出节点 Vout]— R下(R1207=4.7kΩ) — GND`。
 
-```
-Vout = 5V × R下 / (Rs + R串 + R下) = 5 × 4.7 / (Rs + 9.4)    （kΩ、V）
-```
+推导分四步（设电阻单位 kΩ、电压单位 V）：
+
+1. **回路电流**：ADC 引脚输入阻抗近似无穷大，输出节点不分走电流，三个元件串联流过同一电流：
+
+   ```
+   I = VCC / (Rs + R串 + R下)
+   ```
+
+2. **输出电压**（ADC 实际读到的，就是 R下 上的压降）：
+
+   ```
+   Vout = I × R下 = VCC × R下 / (Rs + R串 + R下) = 5 × 4.7 / (Rs + 9.4)
+   ```
+
+   可见 Vout 是 Rs 的减函数：**气体浓度↑ → Rs↓ → Vout↑**。
+
+3. **码值 → 电压**（分辨率定义：4096 级刻度铺满 0~VREF，raw 就是走过的刻度数）：
+
+   ```
+   Vout = VREF × raw / 4095 = 3.3 × raw / 4095
+   ```
+
+4. **反解 Rs**（第 2 步等式两边解出 Rs，供查浓度曲线）：
+
+   ```
+   Rs = VCC × R下 / Vout − (R串 + R下) = 5 × 4.7 / Vout − 9.4
+   ```
+
+第 3、4 两式就是第 6、7 两章代码中 `Raw_To_Volt()` 与 `Volt_To_Rs()` 的实现依据，函数注释里标注了对应步骤。
 
 **② 为什么这个电路天然安全**。Rs ≥ 0，分母最小为 9.4，因此 **Vout 上限 = 5 × 4.7/9.4 = 2.5V**，无论气体浓度多高都不会超过 2.5V——始终落在 ADC 的 0~3.3V 量程和引脚耐压之内，**不需要外加衰减电路，软件也无需还原系数**。
 
 **③ 反推算例（读数 → Rs）**。设某时刻 PC4 打印 `raw=1548`：
 
 ```
-Vout = 3.3 × 1548 / 4096 ≈ 1.246V
+Vout = 3.3 × 1548 / 4095 ≈ 1.246V
 Rs   = 5 × 4.7 / 1.246 − 9.4 ≈ 9.5kΩ
 ```
 
@@ -316,7 +342,7 @@ typedef struct {
 
 ## 5. STM32CubeMX 配置工程
 
-以下为全新工程从零配置 ADC1 双通道 + DMA 的完整步骤（串口打印链路沿用《串口通信》笔记的 USART1 配置）。
+以下为全新工程从零配置 ADC1 的完整步骤。后文两个实验对应两套 CubeMX 配置，先按实验一配**模式 A（单通道、无 DMA）**，做完再改回**模式 B（双通道 + DMA）**做实验二（串口打印链路沿用《串口通信》笔记的 USART1 配置）。
 
 ### 5.1 新建工程与芯片选择
 
@@ -330,13 +356,22 @@ typedef struct {
 
 ### 5.3 配置 ADC1
 
-1. **Analog → ADC1 → Mode**：选 **IN13 & IN14**（芯片图上 PC3、PC4 自动出现），Mode 保持 **Independent Mode**；
-2. **ADC Settings → Parameter Settings**：按表 4-1 设置——分辨率 12 bits、Prescaler ÷4、Scan Mode **Enable**、Continuous Conversion **Enable**、EOC 选 *Each time ADC conversion period is ended*、Rules Number **2**、外部触发 *Disable*（即软件触发）、DMA Continuous Requests **Enable**、Data Alignment 右对齐；
-3. **Regular Conversion Settings** 表格：
+**模式 A（实验一：单通道，轮询读取，不用 DMA）**
+
+1. **Analog → ADC1 → Mode**：只勾 **IN14**（PC4/GAS，芯片图上 PC4 自动出现），Mode 保持 **Independent Mode**；
+2. **ADC Settings → Parameter Settings**：分辨率 12 bits、Prescaler ÷4、Scan Mode **Disable**、Continuous Conversion **Enable**（自动反复转换，读取时永远有新鲜数据）、Rules Number **1**、外部触发 *Disable*（软件触发）、DMA Continuous Requests **Disable**、EOC 选 *Each time ADC conversion period is ended*、Data Alignment 右对齐；
+3. **Regular Conversion Settings**：Rank 1 → **Channel 14** → Sampling Time **144 Cycles**；
+4. **DMA Settings**：不添加任何 DMA 传输；**NVIC Settings**：不勾选（本实验用轮询）。
+
+**模式 B（实验二：双通道 + DMA）**
+
+1. **Mode** 改勾 **IN13 & IN14**（PC3、PC4 都出现），Independent Mode；
+2. **Parameter Settings**：Scan Mode **Enable**、Continuous **Enable**、Rules Number **2**、DMA Continuous Requests **Enable**，其余同模式 A；
+3. **Regular Conversion Settings**：
    - Rank 1 → **Channel 13**（PC3，MP503）→ Sampling Time **144 Cycles**；
    - Rank 2 → **Channel 14**（PC4，MP-4）→ Sampling Time **144 Cycles**；
-4. 双击 **DMA Settings → Add**：Stream **DMA2 Stream0**、Request **ADC1**、Mode **Circular**、Data Width 两端均 **Half Word**（或 Word，与缓冲区类型一致，HAL 用 Word 时缓冲区必须 `uint32_t`）、Priority Medium；
-5. （可选）若要用转换完成中断回调，在 **NVIC Settings** 勾选 *ADC1 global interrupt*；纯 DMA 轮询读可不勾。
+4. **DMA Settings → Add**：Stream **DMA2 Stream0**、Request **ADC1**、Mode **Circular**、Data Width 两端均 **Half Word**（若缓冲区用 `uint32_t`，Memory 端选 Word，与 HAL 约定一致，见 6.2 节说明）、Priority Medium；
+5. NVIC 可不勾——DMA 模式下转换与搬运全由硬件闭环完成，主循环直接读缓冲即可。
 
 ### 5.4 顺带配置 USART1（打印输出）
 
@@ -347,10 +382,10 @@ Connectivity → USART1 → Asynchronous（PA9/PA10），115200-8-N-1，勾选�
 Project Manager 填工程名与路径（如 `ADC_gas_monitor`），工具链选 MDK-ARM 或 CubeIDE，**GENERATE CODE**。重点阅读三处：
 
 - `adc.c`：`MX_ADC1_Init()` 与 `HAL_ADC_MspInit()`；
-- `dma.c`：`MX_DMA_Init()`（注意函数调用顺序——DMA 控制器时钟必须在 `HAL_ADC_Init` 之前使能，CubeMX 已排好）；
-- `stm32f4xx_it.c`：`DMA2_Stream0_IRQHandler()` → `HAL_ADC_IRQHandler` 的挂接。
+- `dma.c`：`MX_DMA_Init()`（**仅模式 B 存在**；注意函数调用顺序——DMA 控制器时钟必须在 `HAL_ADC_Init` 之前使能，CubeMX 已排好）；
+- `stm32f4xx_it.c`：`DMA2_Stream0_IRQHandler()` → `HAL_ADC_IRQHandler` 的挂接（仅模式 B）。
 
-CubeMX 生成的 MspInit 关键片段（列表 1: 代码清单 5-1）：
+模式 B 下 CubeMX 生成的 MspInit 关键片段（列表 1: 代码清单 5-1；模式 A 没有 `hdma_adc1` 段落，其余相同）：
 
 ```c
 void HAL_ADC_MspInit(ADC_HandleTypeDef* adcHandle)
@@ -387,66 +422,55 @@ void HAL_ADC_MspInit(ADC_HandleTypeDef* adcHandle)
 
 ---
 
-## 6. 实验：PC4 采集 MP-4 燃气值 + PC3 采集 MP503 空气质量
+## 6. 实验一：单通道采集 MP-4 燃气值（PC4，轮询，不用 DMA）
 
-**实验目标**：ADC1 以扫描+连续转换方式循环采集 CH13（MP503）与 CH14（MP-4），DMA 环形缓冲自动搬运，主循环每 1 秒把两路原始码值、引脚电压、反推的气敏电阻 Rs 打印到串口调试助手。
+**实验目标**：只用 ADC1 采集 CH14（PC4，MP-4 燃气），**不配置 DMA**——主循环用 `HAL_ADC_PollForConversion()` 轮询等待转换结束、`HAL_ADC_GetValue()` 读数，每 1 秒打印原始码值、引脚电压与反推的气敏电阻 Rs（换算公式的完整推导见 3.3 节①，代码注释标注了对应步骤）。本实验帮助看清"一次转换从触发到取数"的完整链路，也是实验二出问题时的对照基准。
 
 ### 6.1 硬件设计
 
-1. 传感器板按第 3 章原理图直连：燃气板输出网络 **PC4/GAS → PC4**，空气板输出网络 **PC3/AIR → PC3**，两路均为板载 4.7kΩ 串 + 4.7kΩ 下拉结构，输出 ≤2.5V，无需外加衰减；
-2. 两板 VCC 接开发板 **5V**，GND 与开发板共地；
-3. 开发板 USART1（PA9/PA10）经 USB 转串口连电脑。
+1. 只接**燃气板**：输出网络 **PC4/GAS → PC4**（板载 4.7kΩ 串 + 4.7kΩ 下拉，输出 ≤2.5V，直连无需衰减）；
+2. 燃气板 VCC 接开发板 **5V**，GND 与开发板共地；
+3. 开发板 USART1（PA9/PA10）经 USB 转串口连电脑；
+4. 空气板本实验可不接（PC3 悬空不影响采集）。
 
-> 接线复查三件事：共地可靠、5V 电流预算够（两枚气敏元件加热回路合计可达百余 mA）、走线避开加热驱动回路与电机等干扰源。
+> 接线复查两件事：共地可靠；5V 电流预算够（加热回路可达数十 mA）。
 
 ### 6.2 软件设计
 
-核心代码写在 `main.c` 的 USER CODE 区；完整工程以 CubeMX 生成的 `adc.c/dma.c/usart.c` 为底。
+CubeMX 按 5.3 节**模式 A** 配置（IN14 单通道、Scan 关、Continuous 开、无 DMA、无 NVIC）。核心代码写在 `main.c` 的 USER CODE 区。
 
 #### 6.2.1 编程要点
 
-1. 使能 ADC 所用 GPIO（PC3/PC4）时钟并配置为 **Analog 模式**（MspInit 完成）；
-2. 配置 ADC 工作参数：12 位、÷4、扫描+连续、软件触发、序列长度 2（CubeMX 完成）；
-3. 配置各通道 Rank 与 144 周期采样时间（CubeMX 完成）；
-4. 配置 ADC1 → DMA2 Stream0 环形传输，外设地址 ADC1->DR，内存地址指向 `adc_value` 数组；
-5. 上电先 `HAL_ADC_Start_DMA(&hadc1, adc_value, 2)` 启动采集；
-6. 主循环取数换算打印；**连续转换 + 环形 DMA 下无需重复启动**。
+1. 使能 GPIOC 与 ADC1 时钟，PC4 配置为 **Analog 模式**（MspInit 完成）；
+2. 配置 ADC：12 位、÷4、单通道、连续转换、软件触发（CubeMX 完成）；
+3. `HAL_ADC_Start()` 启动转换——连续模式下转换自动循环；
+4. 主循环 `HAL_ADC_PollForConversion()` 等待本次转换结束，`HAL_ADC_GetValue()` 读数；
+5. 按 3.3 节推导式把码值换算成电压与 Rs 打印。
 
 #### 6.2.2 代码分析
 
-列表 2: 代码清单 6-1 采集缓冲与宏定义
-
-```c
-/* USER CODE BEGIN PV */
-#define ADC_CH_NUM        2
-#define VREF              3.3f
-#define ADC_FULLSCALE     4095.0f
-#define VS_EN             5.0f      /* 传感器板供电 */
-#define R_SER             4.7f      /* 串联电阻 kΩ：R1208/R1201 */
-#define R_DOWN            4.7f      /* 下拉电阻 kΩ：R1207/R1185 */
-
-__IO uint32_t adc_value[ADC_CH_NUM]; /* DMA 目标缓冲：[0]=CH13 [1]=CH14 */
-/* USER CODE END PV */
-```
-
-> 缓冲区类型必须与 CubeMX 的 DMA Memory Data Width 一致：选 Half Word 时用 `uint16_t` 数组也可以，但 HAL 的 `HAL_ADC_Start_DMA` 约定传 `uint32_t*`，故推荐 Word + `uint32_t`。
-
-列表 3: 代码清单 6-2 电压与气敏电阻换算函数
+列表 2: 代码清单 6-1 换算函数（与 3.3 节①推导步骤一一对应，两个实验共用）
 
 ```c
 /* USER CODE BEGIN 0 */
-/* 码值 → 引脚电压(V) */
-static float Adc_To_Volt(uint32_t raw)
+#define VREF          3.3f    /* ADC 参考电压(V) */
+#define FULL_SCALE    4095.0f /* 12 位满量程码值 */
+#define VS_EN         5.0f    /* 传感器板供电 VCC(V) */
+#define R_SER         4.7f    /* 串联电阻 R1208/R1201(kΩ) */
+#define R_DOWN        4.7f    /* 下拉电阻 R1207/R1185(kΩ) */
+
+/* 推导步骤3：4096 级刻度铺满 0~VREF，raw 即走过的刻度数
+   Vout = VREF × raw / 4095 */
+static float Raw_To_Volt(float raw)
 {
-  return (float)raw * VREF / ADC_FULLSCALE;
+  return raw * VREF / FULL_SCALE;
 }
 
-/* 引脚电压 → 反推气敏元件电阻 Rs(kΩ)，公式见 3.3 节：
-   Vout = VS × R下 / (Rs + R串 + R下)  →  Rs = VS×R下/Vout − (R串+R下)
-   Vout 接近 0（清洁空气、Rs 极大）时钳位到 999kΩ */
-static float Adc_To_Rs(uint32_t raw)
+/* 推导步骤2：Vout = VCC × R下 / (Rs + R串 + R下)
+   推导步骤4（反解）：Rs = VCC × R下 / Vout − (R串 + R下)
+   Vout 接近 0（清洁空气、Rs 极大）时钳位 999kΩ 防除零 */
+static float Volt_To_Rs(float vout)
 {
-  float vout = Adc_To_Volt(raw);
   float rs;
   if (vout < 0.01f) return 999.0f;
   rs = VS_EN * R_DOWN / vout - (R_SER + R_DOWN);
@@ -455,7 +479,88 @@ static float Adc_To_Rs(uint32_t raw)
 /* USER CODE END 0 */
 ```
 
-列表 4: 代码清单 6-3 主函数
+列表 3: 代码清单 6-2 主函数（轮询读取，无 DMA）
+
+```c
+int main(void)
+{
+  HAL_Init();
+  SystemClock_Config();        /* 168MHz, PCLK2=84MHz */
+  MX_GPIO_Init();
+  MX_ADC1_Init();              /* 模式 A：CH14 单通道，无 DMA */
+  MX_USART1_UART_Init();       /* 115200 8-N-1 */
+
+  HAL_ADC_Start(&hadc1);       /* 软件触发启动，连续模式自动循环 */
+
+  while (1)
+  {
+    /* 轮询等待本次转换结束（100ms 超时） */
+    if (HAL_ADC_PollForConversion(&hadc1, 100) == HAL_OK)
+    {
+      float raw  = (float)HAL_ADC_GetValue(&hadc1);
+      float vout = Raw_To_Volt(raw);   /* 码值 → 电压 */
+      float rs   = Volt_To_Rs(vout);   /* 电压 → Rs(kΩ) */
+
+      printf("MP-4(GAS) raw=%6.0f  V=%.3fV  Rs=%.1fkΩ\r\n",
+             raw, vout, rs);
+    }
+    HAL_Delay(1000);
+  }
+}
+```
+
+**代码要点分析**：
+
+1. **轮询的代价**：`HAL_ADC_PollForConversion()` 内部就是反复查 ADC_SR 的 EOC 标志，等待期间 CPU 全程陪跑。本实验一轮转换仅约 7.4µs（2.5 节），1 秒打印周期里 CPU 绝大部分时间在 `HAL_Delay`，陪跑无所谓；若通道多、采样率高，这种方式就不可接受——这正是实验二引入 DMA 的动机。
+2. **连续模式的取数时机**：Continuous=Enable 时转换自动循环，读 DR 拿到的总是"最近一次完成"的值；若要严格"触发一次只转一次"，把 Continuous 关闭，每次转换前手动 `HAL_ADC_Start()`。
+3. **单通道没有覆盖/串位问题**：Scan 关闭、只有一个规则通道，DR 里永远只有 CH14 的数据，也就不涉及 Rank 与数组下标的对应关系。
+
+### 6.3 下载验证
+
+编译下载，串口助手（115200-8-N-1）每秒打印一行。静置时 Rs 应处于高阻（清洁空气几十 kΩ 以上）且稳定；对着燃气板轻呼一口气或靠近打火机出气口（**轻试即离**），raw 上升、Rs 下降，撤离后缓慢回升。
+
+---
+
+## 7. 实验二：双通道同时采集（PC3+PC4）+ DMA 数据搬运
+
+**实验目标**：ADC1 扫描模式同时采集 CH13（MP503 空气质量）与 CH14（MP-4 燃气），**DMA 环形缓冲自动搬运**，主循环每 1 秒把两路码值、电压、Rs（换算函数直接复用代码清单 6-1）打印到串口调试助手。
+
+### 7.1 硬件设计
+
+1. 两传感器板按第 3 章原理图直连：**PC4/GAS → PC4**、**PC3/AIR → PC3**，均为板载 4.7kΩ 串 + 4.7kΩ 下拉结构，输出 ≤2.5V，无需外加衰减；
+2. 两板 VCC 接开发板 **5V**，GND 与开发板共地；
+3. 开发板 USART1（PA9/PA10）经 USB 转串口连电脑。
+
+> 接线复查三件事：共地可靠、5V 电流预算够（两枚气敏元件加热回路合计可达百余 mA）、走线避开加热驱动回路与电机等干扰源。
+
+### 7.2 软件设计
+
+CubeMX 按 5.3 节**模式 B** 配置（IN13+IN14、Scan 开、序列长度 2、DMA2 Stream0 Circular）。核心代码写在 `main.c` 的 USER CODE 区。
+
+#### 7.2.1 编程要点
+
+1. 使能 GPIO（PC3/PC4）、ADC1、DMA2 时钟，引脚 **Analog 模式**（MspInit 完成）；
+2. 配置 ADC：12 位、÷4、扫描+连续、软件触发、序列长度 2（CubeMX 完成）；
+3. 配置各通道 Rank（CH13→Rank1，CH14→Rank2）与 144 周期采样时间（CubeMX 完成）；
+4. 配置 ADC1 → DMA2 Stream0 环形传输：外设地址 ADC1->DR、内存地址指向 `adc_value` 数组、`__HAL_LINKDMA` 挂接（CubeMX 完成）；
+5. 上电 `HAL_ADC_Start_DMA(&hadc1, adc_value, 2)` 启动采集；
+6. 主循环取数换算打印；**连续转换 + 环形 DMA 下无需重复启动**。
+
+#### 7.2.2 代码分析
+
+列表 4: 代码清单 7-1 采集缓冲定义
+
+```c
+/* USER CODE BEGIN PV */
+#define ADC_CH_NUM 2
+/* DMA 目标环形缓冲：下标跟 Rank 走 —— [0]=Rank1=CH13(PC3)，[1]=Rank2=CH14(PC4) */
+__IO uint32_t adc_value[ADC_CH_NUM];
+/* USER CODE END PV */
+```
+
+> 缓冲区类型必须与 CubeMX 的 DMA Data Width 一致：`HAL_ADC_Start_DMA` 约定传 `uint32_t*`，故缓冲区用 `uint32_t`、Memory 端选 Word；若两端都配 Half Word，则数组改用 `uint16_t` 并在调用处强转。
+
+列表 5: 代码清单 7-2 主函数（DMA 读取；`Raw_To_Volt()`/`Volt_To_Rs()` 与代码清单 6-1 相同，直接复用）
 
 ```c
 int main(void)
@@ -464,7 +569,7 @@ int main(void)
   SystemClock_Config();        /* 168MHz, PCLK2=84MHz */
   MX_GPIO_Init();
   MX_DMA_Init();               /* DMA 时钟先于 ADC 初始化 */
-  MX_ADC1_Init();              /* 扫描+连续+2 通道 */
+  MX_ADC1_Init();              /* 模式 B：扫描+连续+2 通道 */
   MX_USART1_UART_Init();       /* 115200 8-N-1 */
 
   /* 启动 DMA 循环采集：一次启动，硬件自动不停 */
@@ -472,10 +577,11 @@ int main(void)
 
   while (1)
   {
-    float v503 = Adc_To_Volt(adc_value[0]);   /* PC3 空气质量 */
-    float v4   = Adc_To_Volt(adc_value[1]);   /* PC4 燃气 */
-    float rs503 = Adc_To_Rs(adc_value[0]);
-    float rs4   = Adc_To_Rs(adc_value[1]);
+    /* 换算步骤与 3.3 节①推导一一对应：步骤3 码值→电压，步骤4 电压→Rs */
+    float v503  = Raw_To_Volt((float)adc_value[0]);  /* PC3 空气质量 */
+    float rs503 = Volt_To_Rs(v503);
+    float v4    = Raw_To_Volt((float)adc_value[1]);  /* PC4 燃气 */
+    float rs4   = Volt_To_Rs(v4);
 
     printf("MP503(空气质量) raw=%4d  V=%.3fV  Rs=%.1fkΩ\r\n",
            adc_value[0], v503, rs503);
@@ -490,12 +596,13 @@ int main(void)
 
 **代码要点分析**：
 
-1. **环形 DMA 免搬运**：连续转换 + Scan + DMA Circular 组合下，硬件每转完一轮（CH13→CH14）就把两个结果写入 `adc_value[0..1]` 并自动回卷，主循环读到的永远是最新一轮数据，CPU 零参与。
+1. **环形 DMA 免搬运**：连续转换 + Scan + DMA Circular 组合下，硬件每转完一轮（CH13→CH14）就把两个结果写入 `adc_value[0..1]` 并自动回卷，主循环读到的永远是最新一轮数据，CPU 零参与——对比实验一，这里没有任何 `PollForConversion`，也没有 EOC 判断。
 2. **取数快照**：严格来说读数组瞬间可能被 DMA 更新，本场景数据慢变、单字访问，无碍；高要求场景用双缓冲或 EOC 中断置标志。
-3. **Rs→浓度**：`Adc_To_Rs` 只把电压换算成气敏元件电阻，这已经是硬件能给到的最"物理"的量。要报 ppm，还需先在清洁空气中标定 R₀（取 Rs/R₀ 比值），再对照规格书的 Rs/R₀—浓度对数曲线查表或拟合幂律 `Rs/R0 = A × ppm^B`——不同个体曲线有差异，量产需逐台标定。
+3. **Rs→浓度**：`Volt_To_Rs` 只把电压换算成气敏元件电阻，这已是硬件能给到的最"物理"的量。要报 ppm，需先在清洁空气中标定 R₀（取 Rs/R₀ 比值），再对照规格书的 Rs/R₀—浓度对数曲线查表或拟合幂律 `Rs/R0 = A × ppm^B`——不同个体曲线有差异，量产需逐台标定。
 4. **预热**：MOS 气敏上电需预热数分钟读数才稳，正式判断前丢弃前 2~5 分钟数据。
+5. **两个实验的取舍**：单通道轮询胜在链路直观、易调试、不占 DMA 资源；双通道 DMA 胜在不占 CPU、可扩展到 16 通道。工程上先跑通轮询验证硬件与换算公式，再切 DMA，是稳妥的开发顺序。
 
-#### 6.2.3 下载验证
+### 7.3 下载验证
 
 1. 编译下载到开发板，串口助手（115200-8-N-1）每秒刷新两组数据；
 2. 静置时两路 Rs 应处于高阻且数值稳定（±2 码内抖动为正常噪声）；
@@ -505,7 +612,7 @@ int main(void)
 
 ---
 
-## 7. 扩展：定时采集与看门狗报警（思路）
+## 8. 扩展：定时采集与看门狗报警（思路）
 
 1. **TIM 触发替代连续转换**：把 Continuous 关闭、外部触发选 TIM2 TRGO（Period Msp），即可精确按 100ms/1s 周期采样，适合与电机等噪声源同步错峰；
 2. **模拟看门狗**：`HAL_ADC_ConfigAnalogOscillator` → 实际 API 为通道级看门狗配置（LTR/HTR 阈值），MP-4 电压越上限即触发报警中断，比主循环轮询响应快且不占 CPU；
@@ -513,15 +620,15 @@ int main(void)
 
 ---
 
-## 8. 本章小结
+## 9. 本章小结
 
-1. ADC 采集链：输入范围（0~3.3V 硬约束）→ 通道映射（PC3=CH13、PC4=CH14，查表选脚）→ Rank 定序列 → 软件触发 → 转换时间 = 采样时间 + 12 周期（高阻抗信号源配 144 周期采样）→ DR 单寄存器必须 DMA 搬 → 码值×VREF/4096 还原电压。
+1. ADC 采集链：输入范围（0~3.3V 硬约束）→ 通道映射（PC3=CH13、PC4=CH14，查表选脚）→ Rank 定序列 → 软件触发 → 转换时间 = 采样时间 + 12 周期（高阻抗信号源配 144 周期采样）→ DR 单寄存器必须 DMA 搬 → 码值×VREF/4095 还原电压、再反推 Rs。
 2. HAL 三层结构：`ADC_HandleTypeDef`（管全局）→ `ADC_InitTypeDef`（ADC 级参数，扫描/连续/触发）→ `ADC_ChannelConfTypeDef`（通道级 Rank/采样时间），CubeMX 面板逐项对应。
 3. 本实验传感器板为**板载 4.7kΩ 串联 + 4.7kΩ 下拉**的分压结构，输出天然限制在 ≤2.5V，直接进 ADC 无需外加衰减；5V 供电、强制共地，电源轨靠 10µF+100nF 去耦压制加热丝纹波。
 4. 多通道标准姿势：Scan + Continuous + DMA Circular 一次启动循环采集；报警类场景升级定时器触发与模拟看门狗。
 5. MP-4（燃气）与 MP503（空气质量）原理同类：加热 SnO₂ 电阻 Rs 随气体浓度下降，板载分压网络把 Rs 变化转成电压；软件按 `Rs = VS×R下/Vout − (R串+R下)` 反推元件电阻，定量浓度还需 R₀ 标定 + 规格书 Rs/R₀—浓度曲线。
 
-## 9. 常见问题速查
+## 10. 常见问题速查
 
 | 现象 | 最可能原因 | 处理 |
 | --- | --- | --- |
