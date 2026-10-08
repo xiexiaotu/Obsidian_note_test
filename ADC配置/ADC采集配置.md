@@ -364,6 +364,10 @@ typedef struct {
 3. **Regular Conversion Settings**：Rank 1 → **Channel 14** → Sampling Time **144 Cycles**；
 4. **DMA Settings**：不添加任何 DMA 传输；**NVIC Settings**：不勾选（本实验用轮询）。
 
+
+
+
+
 **模式 B（实验二：双通道 + DMA）**
 
 1. **Mode** 改勾 **IN13 & IN14**（PC3、PC4 都出现），Independent Mode；
