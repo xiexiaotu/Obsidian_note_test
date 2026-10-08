@@ -363,7 +363,7 @@ typedef struct {
 2. **ADC Settings → Parameter Settings**：分辨率 12 bits、Prescaler ÷4、Scan Mode **Disable**、Continuous Conversion **Enable**（自动反复转换，读取时永远有新鲜数据）、Rules Number **1**、外部触发 *Disable*（软件触发）、DMA Continuous Requests **Disable**、EOC 选 *Each time ADC conversion period is ended*、Data Alignment 右对齐；
 3. **Regular Conversion Settings**：Rank 1 → **Channel 14** → Sampling Time **144 Cycles**；
 4. **DMA Settings**：不添加任何 DMA 传输；**NVIC Settings**：不勾选（本实验用轮询）。
-
+![](Pasted%20image%2020261008143744.png)
 
 
 
