@@ -484,6 +484,7 @@ static float Volt_To_Rs(float vout)
 /* USER CODE END 0 */
 ```
 
+![](Pasted%20image%2020261008144347.png)
 列表 3: 代码清单 6-2 主函数（轮询读取，无 DMA）
 
 ```c
