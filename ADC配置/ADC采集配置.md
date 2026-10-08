@@ -485,6 +485,7 @@ static float Volt_To_Rs(float vout)
 ```
 
 ![](Pasted%20image%2020261008144347.png)
+![](Pasted%20image%2020261008145143.png)
 列表 3: 代码清单 6-2 主函数（轮询读取，无 DMA）
 
 ```c
@@ -516,6 +517,7 @@ int main(void)
 ```
 
 ![](Pasted%20image%2020261008144703.png)
+![](Pasted%20image%2020261008145111.png)
 **代码要点分析**：
 
 1. **轮询的代价**：`HAL_ADC_PollForConversion()` 内部就是反复查 ADC_SR 的 EOC 标志，等待期间 CPU 全程陪跑。本实验一轮转换仅约 7.4µs（2.5 节），1 秒打印周期里 CPU 绝大部分时间在 `HAL_Delay`，陪跑无所谓；若通道多、采样率高，这种方式就不可接受——这正是实验二引入 DMA 的动机。
