@@ -122,7 +122,7 @@ I2C 使用 SDA 传输数据、使用 SCL 进行同步，每个时钟周期传输
 - 10 位地址器件：先发固定的 `11110xx` + 地址高 2 位，再发地址低 8 位；
 - **主机发送地址后，只有地址匹配的从机才会回应答（ACK）**，其余从机保持沉默。写数据时主机发、从机应答；读数据时从机发、主机应答。
 
-> **工程上极易混淆的一点**：同一个器件地址常有两种写法。以 AT24C02 为例，7 位地址是 `1010000b = 0x50`，而"8 位形式"（把地址左移一位、低位拼上 R/W）是 `0xA0`（写）/ `0xA1`（读）。**STM32 HAL 库的 API 用的是 8 位形式**，即 `HAL_I2C_Mem_Write(&hi2c1, 0xA0, ...)`。本笔记后面每一个传感器都会同时给出两种写法。
+> **工程上极易混淆的一点**：同一个器件地址常有两种写法。以 AT24C02 为例，7 位地址是 `1010000b = 0x50`；总线上真正发出的 8 位地址字节是 `0xA0`（写）/ `0xA1`（读）。**STM32 HAL 的 `DevAddress` 参数填写的是"7 位地址左移 1 位、最低位填 0"的形式**，也就是 `0xA0`；读写方向位由 HAL 在底层自动补上，所以 `HAL_I2C_Mem_Read()` 也传 `0xA0`，不要传 `0xA1`。只有自己手写软件 I2C、亲自发送地址字节时，才需要区分 `0xA0` 和 `0xA1`。
 
 #### 1.2.5 应答（ACK）与非应答（NACK）
 
@@ -170,7 +170,7 @@ F407VET6 各 I2C 的引脚映射（CubeMX 选引脚时直接查这张表）：
 | I2C2 | APB1（42MHz） | PB10 / PF1 | PB11 / PF0 | AF4 | PF0/PF1 只在 100 脚以上封装才有 |
 | I2C3 | APB1（42MHz） | PA8 | PC9 | AF4 | I2C3 的另一组引脚在 PH7/PH8，**VET6 没有 PH 口**，只能用 PA8/PC9 |
 
-> 说明：I2C1 的 SCL 可选 PB6 或 PB8、SDA 可选 PB7 或 PB9，两组引脚任选一组即可，**不能交叉**（不能 PB6 配 PB9）。
+> 说明：I2C1 的 SCL 可选 PB6 或 PB8，SDA 可选 PB7 或 PB9；在 STM32F4 的复用功能里，SCL 候选脚和 SDA 候选脚本质上是独立选择的。工程上通常成对使用 PB6/PB7 或 PB8/PB9，布线和排查更清楚，但并非协议或外设硬性禁止 PB6/PB9 这类组合。
 > **极易踩的坑（本笔记的关键结论）**：F407VET6 的 I2C 只能复用在上表这几个引脚上，**PA0、PA1 没有 I2C 复用功能**（PA0 只有 TIM2_CH1/TIM5_CH1/TIM8_ETR/USART2_CTS/UART4_TX/ETH_MII_CRS/ADC123_IN0，PA1 只有 TIM2_CH2/TIM5_CH2/USART2_RTS/UART4_RX/ETH_MII_RX_CLK/ADC123_IN1）。因此当你的传感器总线接在 **PA1=SCL、PA0=SDA** 上时，**只能使用软件 I2C（GPIO 模拟）**，片上 I2C 外设的信号根本引不到这两个脚上。详见第 6.8 节。
 > 补充：I2C 外设还有一个 **SMBA** 引脚，只用于 SMBus 的警报信号，普通 I2C 通讯不使用，CubeMX 配置 I2C 模式时不会占用它。
 
@@ -192,7 +192,7 @@ CubeMX 中把 I2C1 的 Mode 选为 **I2C** 后，PB8/PB9 被自动配置为 `GPI
 
 SCL 的时钟由 `I2C_CCR` 寄存器控制。CCR 是一个 **12 位**的分频系数，并配合 `I2C_CCR` 的 DUTY 位选择占空比：
 
-**标准模式（Sm = 1，最高 100kHz）**，占空比固定 1:1：
+**标准模式（F/S = 0，最高 100kHz）**，占空比固定 1:1：
 
 ```
 Thigh = CCR × TPCLK1
@@ -236,8 +236,8 @@ I2C 外设的"控制中心"由以下寄存器构成：
 
 | 寄存器 | 作用 |
 | --- | --- |
-| `I2C_CR1` | 使能外设（PE）、起始/停止控制（START/STOP）、应答控制（ACK）、中断使能 |
-| `I2C_CR2` | 中断/DMA 使能、工作频率 FREQ、从机地址发送控制 |
+| `I2C_CR1` | 使能外设（PE）、起始/停止控制（START/STOP）、应答控制（ACK/POS）、软件复位（SWRST）等 |
+| `I2C_CR2` | APB1 工作频率 FREQ、事件/缓冲/错误中断使能、DMA 使能、LAST 控制 |
 | `I2C_CCR` | SCL 时钟分频（见 3.2） |
 | `I2C_TRISE` | 最大上升时间（总线时序） |
 | `I2C_OAR1/OAR2` | 自身从机地址 |
@@ -256,6 +256,8 @@ SR1/SR2 是**状态机**的核心：HAL 库的 `HAL_I2C_Master_Transmit()` 之�
 | EV8_2 | `TXE = 1` 且 `BTF = 1` | 最后一个字节已发完 | 置 STOP 结束传输 |
 | EV7 | `RXNE = 1` | 接收数据寄存器非空 | 读 DR 取走数据 |
 | EV7_1 | `RXNE = 1` 且 `BTF = 1` | 最后一个字节已收到 | 回 NACK 后置 STOP |
+
+> 注意：F4 硬件 I2C 接收最后 1~2 个字节时，ACK、POS、STOP 的置位顺序比较讲究，和读取字节数有关。上表只用于理解状态机大方向；实际工程里优先交给 HAL 函数处理，手写寄存器驱动时要严格按参考手册的 master receiver 流程来。
 
 **表 3-3 常用错误标志**
 
@@ -319,7 +321,7 @@ typedef struct {
 | Dual Address Mode | `DualAddressMode` | `I2C_DUALADDRESS_DISABLE` | 一般不用 |
 | Own Address 2 | `OwnAddress2` | 0 | 仅 7 位 |
 | General Call | `GeneralCallMode` | `I2C_GENERALCALL_DISABLE` | 一般不用 |
-| No Clock Stretch | `NoStretchMode` | `I2C_NOSTRETCH_DISABLE` | **必须允许延展**，HTU21D 依赖它 |
+| No Clock Stretch | `NoStretchMode` | `I2C_NOSTRETCH_DISABLE` | 建议保持允许延展；HTU21D 的 Hold Master 模式依赖它 |
 
 > **重要提醒一**：`I2C_InitTypeDef` 的成员随 STM32 系列而变。**F1/F2/F4 用 `ClockSpeed` + `DutyCycle`（填写"要多少 kHz"，硬件自己算 CCR）**；而 F7/L4/H7 等较新系列改成了 **`Timing`**（填写一个算好的 32 位时序值）。网上很多 F4 教程里出现 `Init.Timing = 0x60201E2B` 的写法，那是 F7/L4 的代码，直接搬到 F407 上会**编译报错或时序全错**，看教程时务必先确认芯片系列。
 > **重要提醒二**：本节讲的都是**硬件 I2C** 的初始化。**软件 I2C 没有任何 `I2C_InitTypeDef` 需要配置**，它只需要把两个 GPIO 配成开漏输出（见第 5.4 节），时序全部由代码用延时循环模拟（见第 8 章）。
@@ -332,8 +334,8 @@ typedef struct {
 | --- | --- | --- |
 | `HAL_I2C_Master_Transmit()` | 主机发送 | **命令型器件**（BH1750、HTU21D）发命令用它 |
 | `HAL_I2C_Master_Receive()` | 主机接收 | 配合上面的函数读取测量结果 |
-| `HAL_I2C_Mem_Write()` | 写器件寄存器/存储单元 | **寄存器型器件**（AT24C02、PCF8563、LIS3DH）首选，内含"写地址 + 重复起始 + 写数据"完整时序 |
-| `HAL_I2C_Mem_Read()` | 读器件寄存器/存储单元 | 同上，内含 Sr 时序 |
+| `HAL_I2C_Mem_Write()` | 写器件寄存器/存储单元 | **寄存器型器件**（AT24C02、PCF8563、LIS3DH）首选，时序为"地址写 + 内部地址 + 数据 + 停止" |
+| `HAL_I2C_Mem_Read()` | 读器件寄存器/存储单元 | 先写内部地址，再用重复起始 Sr 转入读方向 |
 | `HAL_I2C_IsDeviceReady()` | 探测从机是否应答 | 返回 `HAL_OK` 说明器件在线，也可用于等待 EEPROM 内部写周期 |
 | `HAL_I2C_GetState()` | 读句柄状态 | 典型值 `HAL_I2C_STATE_READY` |
 | `HAL_I2C_Master_Transmit_IT()` 等 | 中断方式 | 完成触发 `HAL_I2C_MasterTxCpltCallback` |
@@ -341,6 +343,7 @@ typedef struct {
 | `HAL_I2C_Slave_Receive_IT()` 等 | 从机方式 | 让 STM32 充当 I2C 从机 |
 
 > `Mem_AddressSize` 参数填 `I2C_MEMADD_SIZE_8BIT`（AT24C02、PCF8563、LIS3DH 都是 8 位寄存器地址）或 `I2C_MEMADD_SIZE_16BIT`（更大容量的 EEPROM，如 AT24C256）。
+> `DevAddress` 参数统一填 7 位地址左移 1 位后的值，例如 AT24C02 填 `0xA0`、BH1750 填 `0x46`。HAL 会根据当前 API 自动发送读/写方向位，所以不要在 `HAL_I2C_Master_Receive()` / `HAL_I2C_Mem_Read()` 里改填 `0xA1`、`0x47` 这类读地址字节。
 > **命令型器件不能套用 Mem 系列函数**：`HAL_I2C_Mem_Write()` 至少要发 1 字节数据，而 BH1750 的"命令"就是一次单独的一字节写（START + 地址 + 命令 + STOP），所以必须用 `HAL_I2C_Master_Transmit()`。
 
 ---
@@ -366,7 +369,7 @@ typedef struct {
 ### 5.3 配置 I2C1（硬件 I2C：PB8/PB9）
 
 1. 左侧 **Connectivity → I2C1**，Mode 选 **I2C**。
-2. 芯片图上出现 I2C1 的候选引脚，**左键点击 PB8 选 `I2C1_SCL`、PB9 选 `I2C1_SDA`**（也可以选 PB6/PB7，两组任选其一，不可交叉）。
+2. 芯片图上出现 I2C1 的候选引脚，**左键点击 PB8 选 `I2C1_SCL`、PB9 选 `I2C1_SDA`**（也可以选 PB6/PB7；若 PCB 已固定，也可以在合法的 SCL 候选脚和 SDA 候选脚之间独立选择）。
 3. **Parameter Settings** 按表 4-1 填写：
 
 **表 5-1 I2C1 Parameter Settings 配置值**
@@ -408,7 +411,7 @@ typedef struct {
 > **为什么软件 I2C 的 GPIO 必须配成"开漏输出"而不是"推挽输出"？**
 > 因为 I2C 是"线与"总线：如果 STM32 用推挽输出把 SDA 拉高（强驱动 3.3V），而此时从机正想把 SDA 拉低来回应答，两个引脚就会直接对打，轻则通讯失败，重则**烧毁引脚**。开漏输出只能拉低、不能主动拉高，高电平交给上拉电阻，这才是 I2C 正确的电气姿势。
 >
-> **另需注意 PA0 是 WKUP 引脚**：如果开发板上 PA0 已接了按键或其它功能，请改用别的空闲 GPIO（例如 PE2/PE3），并同步修改 7.3 节代码里的引脚宏。
+> **另需注意 PA0 是 WKUP 引脚**：如果开发板上 PA0 已接了按键或其它功能，请改用别的空闲 GPIO（例如 PE2/PE3），并同步修改第 8、9 章代码里的引脚宏。
 
 ### 5.5 顺带配置 USART1（串口输出）
 
@@ -542,7 +545,7 @@ ssize_t _write(int fd, const void *pdata, size_t bytes)
 
 > **两类器件的区别是本笔记的一条主线**：
 > **命令型**器件（BH1750、HTU21D）没有"寄存器地址"概念，主机直接写一条命令字节让它开始测量，再直接读结果，代码上用 `HAL_I2C_Master_Transmit/Receive`（软件 I2C 用"起始+地址+命令+停止"）；
-> **寄存器型**器件（PCF8563、LIS3DH、AT24C02）有明确的寄存器/存储地址，主机先给出地址再读写数据，代码上用 `HAL_I2C_Mem_Write/Mem_Read`（内部含**重复起始 Sr**）。
+> **寄存器型**器件（PCF8563、LIS3DH、AT24C02）有明确的寄存器/存储地址，主机先给出地址再读写数据，代码上用 `HAL_I2C_Mem_Write/Mem_Read`；其中 `Mem_Read` 会用到**重复起始 Sr**。
 
 ### 6.2 同一组 I2C 总线接线
 
@@ -591,9 +594,9 @@ ssize_t _write(int fd, const void *pdata, size_t bytes)
 | PCF8563 时钟 | 0x51 | 0xA2 | 0xA3 | 固定，不可改 |
 | （可选）MPU6050 | 0x68 | 0xD0 | 0xD1 | AD0 引脚（接高 → 0x69 / 0xD2 / 0xD3） |
 
-**"地址互不相同"是它们能共用一组总线的唯一前提**：0x18、0x23、0x40、0x50、0x51 五个地址两两不同，所以可以全部并接在 PA1/PA0 上互不干扰。如果两个器件地址相同（例如两片 AT24C02），必须通过 A0/A1/A2、ADDR、SA0 这类地址跳线引脚把其中一个改到别的地址，否则必然通讯失败。**接线前先用万用表量一下这些跳线引脚的电平，是最省事的排错手段。**
+**"地址互不相同"是它们能共用一组总线的协议层前提**：0x18、0x23、0x40、0x50、0x51 五个地址两两不同，所以主机可以靠地址区分它们。除此之外，还要满足上拉电阻、总线电容、电平兼容、共地等电气条件。如果两个器件地址相同（例如两片 AT24C02），必须通过 A0/A1/A2、ADDR、SA0 这类地址跳线引脚把其中一个改到别的地址，否则必然通讯失败。**接线前先用万用表量一下这些跳线引脚的电平，是最省事的排错手段。**
 
-> **为什么 PCF8563 和 AT24C02 的地址这么接近（0x50 / 0x51）？** 因为它们的 7 位地址高 4 位都是固定的 `1010`，AT24C02 低 3 位由 A2/A1/A0 决定（全 0 时即 0x50），PCF8563 则固定为 `001`（0x51）。只要 AT24C02 的 A0 不是 1，两者就不会冲突。
+> **为什么 PCF8563 和 AT24C02 的地址这么接近（0x50 / 0x51）？** 因为它们的 7 位地址高 4 位都是固定的 `1010`，AT24C02 低 3 位由 A2/A1/A0 决定（全 0 时即 0x50），PCF8563 则固定为 `001`（0x51）。只有 AT24C02 的 A2/A1/A0 被接成 `001` 时才会和 PCF8563 冲突；全 0 的默认接法不冲突。
 
 ### 6.4 BH1750 光照传感器
 
@@ -664,8 +667,8 @@ ssize_t _write(int fd, const void *pdata, size_t bytes)
 
 | 地址 | 名称 | 说明 |
 | --- | --- | --- |
-| `0x00` | 控制寄存器 1 | TEST、STOP（**置 1 停表**）、TEST1、AIE、AF 等 |
-| `0x01` | 控制寄存器 2 | 报警中断、定时器中断使能 |
+| `0x00` | 控制寄存器 / 状态寄存器 1 | TEST1、STOP（**置 1 停表**）、TESTC 等 |
+| `0x01` | 控制寄存器 / 状态寄存器 2 | TI/TP、AF、TF、AIE、TIE 等报警/定时器标志与使能 |
 | `0x02` | 秒（VL_Seconds） | 位 7 = VL（时钟完整性标志，为 1 表示时间可能不准），位 6~0 = 秒 BCD |
 | `0x03` | 分（Minutes） | 位 7 恒 0，位 6~0 = 分 BCD |
 | `0x04` | 时（Hours） | 位 6~0 = 时 BCD |
@@ -705,7 +708,7 @@ ssize_t _write(int fd, const void *pdata, size_t bytes)
 1. **先读 WHO_AM_I 确认器件**：返回 0x33 才继续初始化，这是最有效的"接线是否正常"检查；
 2. **多字节读要置子地址最高位**：LIS3DH 要求在寄存器地址上置 **MSB = 1**（即 `out_x_l | 0x80`）才启用**地址自动递增**，否则连续读到的都是同一个寄存器；
 3. **数据是小端**，与 MPU6050（大端）相反：`acc = (int16_t)((buf[1] << 8) | buf[0])`；
-4. 本笔记采用 `CTRL_REG1 = 0x57`（ODR = 100Hz、XYZ 使能）、`CTRL_REG4 = 0x08`（±2g、高分辨率 12 位），此时灵敏度为 **1 mg/LSB**，静止平放时某一轴读数约为 **±1000**（对应 1g），可用这个常识判断数据是否可信。
+4. 本笔记采用 `CTRL_REG1 = 0x57`（ODR = 100Hz、XYZ 使能）、`CTRL_REG4 = 0x88`（BDU=1、±2g、高分辨率 12 位）。高分辨率输出在 16 位寄存器中**左对齐**，组合成 `int16_t` 后要右移 4 位；右移后的灵敏度为 **1 mg/LSB**，静止平放时某一轴读数约为 **±1000**（对应 1g），可用这个常识判断数据是否可信。
 
 ### 6.8 关键结论：这套传感器必须用软件 I2C
 
@@ -716,7 +719,7 @@ ssize_t _write(int fd, const void *pdata, size_t bytes)
 | PA0 | TIM2_CH1、TIM5_CH1、TIM8_ETR、USART2_CTS、UART4_TX、ETH_MII_CRS、ADC123_IN0 | **没有** |
 | PA1 | TIM2_CH2、TIM5_CH2、USART2_RTS、UART4_RX、ETH_MII_RX_CLK、ADC123_IN1 | **没有** |
 
-STM32F407VET6 的 I2C 引脚是**固定**的（表 2-1）：I2C1 = PB6/PB7 或 PB8/PB9，I2C2 = PB10/PB11 或 PF0/PF1，I2C3 = PA8/PC9，全部使用 AF4，**PA0/PA1 不在其中**。由此得到三条结论：
+STM32F407VET6 的 I2C 引脚是**固定**的（表 2-1）：I2C1 的 SCL 为 PB6/PB8、SDA 为 PB7/PB9，I2C2 的 SCL 为 PB10/PF1、SDA 为 PB11/PF0，I2C3 = PA8/PC9，全部使用 AF4，**PA0/PA1 不在其中**。由此得到三条结论：
 
 1. **按现有接线表（SCL=PA1、SDA=PA0）驱动这套传感器，只能用软件 I2C**——片上 I2C 外设的信号无法引到这两个脚上，CubeMX 里也点不出这两个引脚为 I2C 功能；
 2. 如果确实想用**硬件 I2C** 驱动同一套传感器，**必须把总线改接到 I2C1 的 PB8/PB9**（推荐）或 I2C3 的 PA8/PC9，硬件接线要跟着改——这正是第 7 章"硬件 I2C 实验"需要修改接线的原因；
@@ -804,7 +807,7 @@ STM32F407VET6 的 I2C 引脚是**固定**的（表 2-1）：I2C1 = PB6/PB7 或 P
 
 #include "stm32f4xx_hal.h"
 
-#define EEPROM_ADDRESS    0xA0   /* 8 位地址：0x50<<1 | 写位 */
+#define EEPROM_ADDRESS    0xA0   /* HAL DevAddress：7 位地址 0x50 左移 1 位 */
 #define EEPROM_PAGESIZE   8      /* AT24C02 页大小，写周期不可跨页 */
 #define EEPROM_MAX_TRIALS 3      /* 探测器件在线时的重试次数 */
 #define EEPROM_TIMEOUT    100    /* 每步超时 ms */
@@ -924,8 +927,7 @@ uint8_t AT24C02_Check(void)
 
 ```c
 /* bsp_bh1750.h */
-#define BH1750_ADDR_W     0x46    /* 8 位写地址：0x23 << 1 */
-#define BH1750_ADDR_R     0x47
+#define BH1750_ADDRESS    0x46    /* HAL DevAddress：7 位地址 0x23 左移 1 位 */
 #define BH1750_POWER_ON   0x01
 #define BH1750_CONT_H_RES 0x10    /* 连续 H 分辨率模式，1 lx */
 
@@ -938,7 +940,7 @@ uint8_t AT24C02_Check(void)
   */
 static void BH1750_WriteCmd(uint8_t cmd)
 {
-  HAL_I2C_Master_Transmit(&hi2c1, BH1750_ADDR_W, &cmd, 1, 100);
+  HAL_I2C_Master_Transmit(&hi2c1, BH1750_ADDRESS, &cmd, 1, 100);
 }
 
 /**
@@ -962,7 +964,7 @@ float BH1750_ReadLux(void)
   uint8_t buf[2];
   uint16_t raw;
 
-  if (HAL_I2C_Master_Receive(&hi2c1, BH1750_ADDR_R, buf, 2, 100) != HAL_OK)
+  if (HAL_I2C_Master_Receive(&hi2c1, BH1750_ADDRESS, buf, 2, 100) != HAL_OK)
   {
     return -1.0f;                     /* 读取失败返回负值，便于串口识别 */
   }
@@ -1144,10 +1146,10 @@ uint8_t I2C_ReadByte(void);
 
 /**
   * @brief  软件 I2C 半周期延时
-  * @note   168MHz 主频下循环 20 次约 1µs，SCL 周期约 2µs，
-  *         实际速率受上升沿限制，实测波形落在 100~400kHz 之间。
-  *         要降低速率（总线较长、模块较多时更稳）就加大循环次数，
-  *         例如调到 100 约为 100kHz。第 9 章挂四个模块时建议用大一些的值。
+  * @note   软件 I2C 的实际速率由 GPIO 翻转开销、优化等级、延时循环和上升沿共同决定。
+  *         HAL_GPIO_WritePin 本身开销较大，所以这里的循环次数不能直接换算成精确频率。
+  *         建议先用逻辑分析仪/示波器测 SCL，再按波形调整循环次数；第 9 章挂四个模块时
+  *         可以适当加大延时，先保证稳定，再追求速度。
   */
 static void I2C_Delay(void)
 {
@@ -1161,6 +1163,17 @@ static void I2C_Delay(void)
 列表 11: 代码清单 8-3 起始信号、停止信号与字节收发
 
 ```c
+/**
+  * @brief  软件 I2C 总线初始化：释放 SCL/SDA，让总线回到空闲高电平
+  * @note   GPIO 的开漏输出模式由 CubeMX 的 MX_GPIO_Init() 完成
+  */
+void I2C_Init(void)
+{
+  I2C_SCL_H();
+  I2C_SDA_H();
+  I2C_Delay();
+}
+
 /**
   * @brief  产生起始信号：SCL 为高电平期间，SDA 由高变低
   */
@@ -1303,11 +1316,11 @@ uint8_t AT24C02_WriteByte(uint8_t memAddr, uint8_t data)
 {
   I2C_Start();
   I2C_SendByte(AT24C02_ADDR_W);                /* 器件地址 + 写 */
-  if (I2C_WaitAck() == 0) { return 0; }        /* 地址无应答，说明器件不在线 */
+  if (I2C_WaitAck() == 0) { I2C_Stop(); return 0; }  /* 地址无应答，说明器件不在线 */
   I2C_SendByte(memAddr);                       /* 片内存储地址 */
-  if (I2C_WaitAck() == 0) { return 0; }
+  if (I2C_WaitAck() == 0) { I2C_Stop(); return 0; }
   I2C_SendByte(data);                          /* 数据 */
-  if (I2C_WaitAck() == 0) { return 0; }
+  if (I2C_WaitAck() == 0) { I2C_Stop(); return 0; }
   I2C_Stop();
 
   HAL_Delay(5);                                /* 等待 EEPROM 内部写周期 tWR（≤5ms） */
@@ -1383,6 +1396,7 @@ int main(void)
   HAL_Init();
   SystemClock_Config();
   MX_GPIO_Init();             /* 其中包含 PA1/PA0 开漏输出配置 */
+  I2C_Init();                 /* 释放 SCL/SDA，确认总线空闲 */
   MX_USART1_UART_Init();
 
   printf("\r\n===== STM32F407VET6 软件 I2C 实验（SCL=PA1, SDA=PA0）=====\r\n");
@@ -1792,7 +1806,7 @@ uint8_t LIS3DH_Init(void)
   }
 
   I2C_WriteReg(LIS3DH_ADDR_W, LIS3DH_CTRL_REG1, 0x57);  /* ODR=100Hz，XYZ 使能 */
-  I2C_WriteReg(LIS3DH_ADDR_W, LIS3DH_CTRL_REG4, 0x08);  /* ±2g，高分辨率(12位) */
+  I2C_WriteReg(LIS3DH_ADDR_W, LIS3DH_CTRL_REG4, 0x88);  /* BDU=1，±2g，高分辨率(12位) */
   return 1;
 }
 
@@ -1800,17 +1814,23 @@ uint8_t LIS3DH_Init(void)
   * @brief  读取三轴加速度原始值
   * @note   1) 子地址需置最高位（|0x80）才启用地址自动递增，否则连读到的都是同一寄存器
   *         2) LIS3DH 输出为小端（低字节在前），与 MPU6050 的大端相反
-  *         3) ±2g + 12 位时灵敏度 1 mg/LSB，静止平放某一轴约为 ±1000
+  *         3) 高分辨率 12 位数据左对齐在 16 位寄存器中，需右移 4 位
+  *         4) 右移后 ±2g 灵敏度 1 mg/LSB，静止平放某一轴约为 ±1000
   */
 void LIS3DH_ReadAcc(short *accData)
 {
   uint8_t buf[6];
+  int16_t rawX, rawY, rawZ;
 
   I2C_ReadRegs(LIS3DH_ADDR_W, LIS3DH_OUT_X_L | 0x80, buf, 6);
 
-  accData[0] = (short)((buf[1] << 8) | buf[0]);   /* X */
-  accData[1] = (short)((buf[3] << 8) | buf[2]);   /* Y */
-  accData[2] = (short)((buf[5] << 8) | buf[4]);   /* Z */
+  rawX = (int16_t)((buf[1] << 8) | buf[0]);
+  rawY = (int16_t)((buf[3] << 8) | buf[2]);
+  rawZ = (int16_t)((buf[5] << 8) | buf[4]);
+
+  accData[0] = rawX / 16;   /* X，单位约 mg */
+  accData[1] = rawY / 16;   /* Y，单位约 mg */
+  accData[2] = rawZ / 16;   /* Z，单位约 mg */
 }
 ```
 
@@ -1836,6 +1856,7 @@ int main(void)
   HAL_Init();
   SystemClock_Config();        /* 168MHz，APB1=42MHz */
   MX_GPIO_Init();              /* 含 PA1(SCL)/PA0(SDA) 开漏输出 */
+  I2C_Init();                  /* 释放 SCL/SDA，确认软件 I2C 总线空闲 */
   MX_USART1_UART_Init();       /* 串口输出 115200-8-N-1 */
 
   printf("\r\n===== 软件 I2C 传感器组测试（SCL=PA1, SDA=PA0）=====\r\n");
@@ -1891,7 +1912,7 @@ int main(void)
 - **四个器件共用一组总线，代码里靠"每次操作都完整起止"来保证互不干扰**。切忌把"给 BH1750 发命令"和"读 HTU21D"拼在同一个起始-停止之间；
 - `I2C_ReadRegs()` 里的第二次 `I2C_Start()` 就是**重复起始 Sr**——PCF8563 和 LIS3DH 都要求"先写寄存器地址、再转读"，中间不能插入停止信号，否则器件会认为本次寻址结束；
 - 两类器件的差异在代码里体现得非常清楚：BH1750/HTU21D 走 `I2C_WriteCmd` + `I2C_ReadBytes`；PCF8563/LIS3DH 走 `I2C_WriteReg` + `I2C_ReadRegs`。**这也是"先分清器件类型再写驱动"的原因**；
-- 每个器件都做了**身份/数据合理性确认**：LIS3DH 读 WHO_AM_I 是否为 0x33、PCF8563 读 VL 位、BH1750/HTU21D 读一次数据看数值是否落在物理合理范围。这样串口日志能直接指出是哪个模块有问题。
+- LIS3DH 做了明确的身份确认（WHO_AM_I = 0x33），PCF8563 用 VL 位判断时间是否可信；BH1750/HTU21D 没有类似固定 ID，本示例通过读数是否落在物理合理范围来辅助判断。若做成正式工程，建议把 `I2C_WriteCmd/I2C_ReadBytes/I2C_WriteReg/I2C_ReadRegs` 改成返回 ACK/超时状态，让串口能精确报出是哪一步失败。
 
 #### 9.2.4 下载验证
 
@@ -2047,7 +2068,7 @@ STM32 的 I2C 也能当从机（例如让 F407 作为一块"传感器板"被另�
 ## 12. 本章小结
 
 1. I2C 分物理层（SDA/SCL 两线、开漏+上拉实现"线与"、总线电容 ≤400pF、100k/400k 速率）和协议层（起始 S、重复起始 Sr、地址+R/W、应答 ACK/NACK、数据、停止 P，**数据只能在 SCL 低电平时变化，SCL 高电平时必须稳定**）。
-2. F407VET6 有 I2C1/I2C2/I2C3 三个外设，**全部挂 APB1（42MHz）、全部用 AF4**；常用 I2C1 = PB8/PB9（或 PB6/PB7），I2C2 = PB10/PB11，I2C3 = PA8/PC9（VET6 无 PH 口）。
+2. F407VET6 有 I2C1/I2C2/I2C3 三个外设，**全部挂 APB1（42MHz）、全部用 AF4**；常用 I2C1 = PB8/PB9（也可用 PB6/PB7，或在合法 SCL/SDA 候选脚中独立选择），I2C2 常用 PB10/PB11，I2C3 = PA8/PC9（VET6 无 PH 口）。
 3. **本笔记最重要的硬件结论**：**PA0/PA1 在 F407VET6 上没有任何 I2C 复用功能**，所以"SCL=PA1、SDA=PA0"这套传感器接线**只能用软件 I2C**；要用硬件 I2C 必须把总线改接到 PB8/PB9（或 PA8/PC9）。
 4. 本套传感器分两类：**命令型**（BH1750 光照 0x23、HTU21D 温湿度 0x40，直接发命令、直接读结果）与**寄存器型**（PCF8563 时钟 0x51、LIS3DH 三轴 0x18，先给寄存器地址再读写）。**两类器件要用两套 API/原语**，这是 I2C 编程最容易搞混的地方。
 5. 五个器件（含 AT24C02 0x50）地址两两不同，才能共用一组总线；接线前务必确认 ADDR/SA0/A0~A2 跳线电平。
@@ -2072,14 +2093,14 @@ STM32 的 I2C 也能当从机（例如让 F407 作为一块"传感器板"被另�
 | HTU21D 读出的温湿度明显离谱 / 读不到 | 用了 Hold Master 模式（0xE3/0xE5）而软件 I2C 不支持时钟延展；或没屏蔽低 2 位状态位 | 改用 No Hold 模式 `0xF3`/`0xF5` 并延时；`raw & 0xFFFC` |
 | BH1750 光照值一直是 0 或很小 | 没发上电命令 `0x01`，或没等 120ms 测量完成 | 按 6.4 节顺序初始化并延时至 180ms |
 | LIS3DH 三轴读数恒定不变 | 多字节读没有置子地址最高位，地址未自增 | 用 `LIS3DH_OUT_X_L \| 0x80` |
-| LIS3DH 数值符号/量级不对 | 按大端组合，或量程与灵敏度不匹配 | 小端组合 `(buf[1]<<8)\|buf[0]`；±2g+12 位时 1 mg/LSB |
+| LIS3DH 数值符号/量级不对 | 按大端组合，忘了 12 位高分辨率数据左对齐，或量程与灵敏度不匹配 | 小端组合 `(buf[1]<<8)\|buf[0]` 后按 `int16_t` 右移/除以 16；±2g+12 位右移后约 1 mg/LSB |
 | PCF8563 时间乱跳或走时错 | 写时间时没有先停表（STOP 位），或 BCD 未转换 | 写前 `CTRL1=0x20`，写完 `CTRL1=0x00`；用 BCD 互转函数 |
 | PCF8563 每次上电时间归零 | 模块没有纽扣电池 | 属正常；用 VL 位判断并重新设置时间 |
 | 波形上升沿是斜坡、读不到数据 | 内部弱上拉不够 / 上拉阻值过大、或**多个模块上拉并联后过小** | 只保留一组 4.7kΩ 上拉（高速 2.2kΩ） |
 | SDA 被从机拉住不放、`BUSY` 一直为 1 | 硬件 I2C 总线死锁 | 调 `I2C_BusRecover()` 手动补 9 个时钟 + 停止条件 |
 | 软件 I2C 在中断里调用后通讯乱掉 | 时序被更高级中断打断，时钟被拉长 | 不要在中断中调用软件 I2C；或调用期间关中断 |
 | 编译报错找不到 `Init.Timing` / `I2C_InitTypeDef` 成员不匹配 | 抄了 F7/L4 的代码 | F4 用 `ClockSpeed` + `DutyCycle` |
-| 从机地址对不上（0x50 还是 0xA0） | 7 位地址与 8 位地址混淆 | **HAL API 传 8 位形式**：0x50→0xA0(写)/0xA1(读)；软件 I2C 同理 |
+| 从机地址对不上（0x50 还是 0xA0） | 7 位地址、HAL 参数与总线地址字节混淆 | HAL `DevAddress` 传 **7 位地址左移 1 位且 bit0=0**：0x50→0xA0，读函数也传 0xA0；软件 I2C 手发地址字节时才区分 0xA0(写)/0xA1(读) |
 | 串口无输出 | 没勾 Use MicroLIB（Keil）、波特率不对、TX/RX 没交叉、没共地 | 见《USART—串口通信》章节的排错表 |
 | 重新生成代码后自己的驱动丢失 | 代码写在 CubeMX 管理区 | 所有手写代码放进 `USER CODE BEGIN/END`，或单独建 `bsp_xxx.c/h` |
 | 硬件 I2C 与软件 I2C 数据不一致 | 其中一个实验的上拉/地址/页边界处理有误 | 用第 7 章硬件驱动去读第 8 章写的数据做交叉验证 |
