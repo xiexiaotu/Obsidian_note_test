@@ -383,6 +383,9 @@ typedef struct {
 
 1. 左侧 **System Core → GPIO**，点击 **PA1**，选择 **GPIO_Output**；再点击 **PA0**，同样选 **GPIO_Output**。
 2. 选中 PA1，在下方 **GPIO mode and Configuration** 面板中按表 5-2 设置；PA0 用同样的参数。
+![](Pasted%20image%2020261015113435.png)
+
+
 
 **表 5-2 软件 I2C 的 GPIO 参数（PA1=SCL、PA0=SDA 相同配置）**
 
