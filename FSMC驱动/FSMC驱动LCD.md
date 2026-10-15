@@ -232,6 +232,8 @@ NT35510 数据手册要求：写周期 twc 最短 **66 ns**，读周期（trdl+t
 
 写周期略低于 66ns 的要求，实测大部分 NT35510 屏仍能正常工作；若出现花屏或白屏，把 **DATAST 加大到 8**（twc ≈ 83ns）就十分稳妥。本笔记代码取 ADDSET = 4、DATAST = 8，留足余量——对秒级刷新传感器数据的应用来说，这点速度差异完全无感。
 
+> **关于这两个式子的说明**：上面是工程上常用的经验式（模式 A / 模式 B 的差别在于读操作是否插入额外的总线周转时间，不同资料写法略有出入）。**对驱动的正确性而言，关键只有一条：时序要留够余量，最终以实测波形为准**——先按 ADDSET = 4、DATAST = 8 配好，能稳定刷屏就不必再抠；出现花屏就加 DATAST（每一步加 2~4），一直加到稳定为止。**DATAST 每加 1 就多约 6ns，加得越多刷屏越慢**：本笔记配置下一次 16 位写周期约 83ns，这也是后文计算"刷一屏要多少 CPU 时间"的基准（854×480 ≈ 41 万像素 × 83ns ≈ 34ms）。
+
 > **排错直觉**：屏幕"能点亮但花屏/颜色错乱"多半是 DATAST 太小、数据还没稳定就被锁存；"完全白屏"多半是 FSMC 根本没配通（先查 NE1 与 A17 的引脚复用）。实测时先用纯色刷屏验证时序，再谈显示内容。
 
 ---
@@ -265,6 +267,8 @@ NT35510 数据手册要求：写周期 twc 最短 **66 ns**，读周期（trdl+t
 | Write operation                           | Enabled       | 必须使能写，否则只能读           |
 
 4. **NVIC / DMA**：FSMC 本身不产生中断与 DMA 请求，这里**不用勾选**（LCD 的 DMA 在第 8 章用 DMA2 内存到内存方式单独配置）。
+
+> **关于配置时可能出现的警告**：勾选 NE1 后，CubeMX 有时会在 FSMC 一栏给出 *Partly disabled conflict with … NE1 Chip Select* 之类的黄色提示。它的含义是"FSMC 占用的一批 GPIO（PD/PE 口的 AF12 引脚）原本还复用着别的外设功能，那部分功能已被自动禁用"，属于**提示而非错误**。核对方法：按 Ctrl+D 看冲突明细，只要冲突的另一方是你用不到的外设（如 ETH、SDIO、其它 USART），且 Pinout 视图里本笔记用到的脚（PD7 = NE1、PD12 = A17、PD4/PD5 = NOE/NWE、PD14/PD15/PD0/PD1/PE7~PE15/PD8~PD10 = 数据线、PD2 = 背光）都不是"硬冲突"，就可以放心忽略。反之若冲突方是你确实要用的外设（如想用 PD8/PD9 做 USART3），就必须给那个外设换到别的引脚。
 
 ### 5.3 配置背光 PD2 与软件 I2C 总线
 
@@ -354,15 +358,15 @@ main.c                  ← 主循环：读传感器 → 刷新 LCD 显示
 #include "stm32f4xx_hal.h"
 
 /* ---------- FSMC 地址宏（计算过程见第 4.2 节） ---------- */
-#define FSMC_LCD_BASE      ((uint32_t)0x60000000)   /* NE1 区域1 基地址 */
-#define LCD_CMD_ADDR       (FSMC_LCD_BASE)          /* A17=0：命令 */
+#define FSMC_LCD_BASE      ((uint32_t)0x60000000U)        /* NE1 区域1 基地址 */
+#define LCD_CMD_ADDR       (FSMC_LCD_BASE)                /* A17=0：命令 */
 #define LCD_DATA_ADDR      (FSMC_LCD_BASE | (1UL << 18))  /* A17=1：数据 */
 
 #define LCD_WRITE_CMD(c)   (*(__IO uint16_t *)(LCD_CMD_ADDR)  = (uint16_t)(c))
 #define LCD_WRITE_DATA(d)  (*(__IO uint16_t *)(LCD_DATA_ADDR) = (uint16_t)(d))
 
-/* ---------- 屏幕参数 ---------- */
-#define LCD_WIDTH    854     /* 横屏分辨率 854×480 */
+/* ---------- 屏幕参数（横屏 854×480） ---------- */
+#define LCD_WIDTH    854
 #define LCD_HEIGHT   480
 
 /* ---------- RGB565 常用颜色 ---------- */
@@ -373,16 +377,29 @@ main.c                  ← 主循环：读传感器 → 刷新 LCD 显示
 #define BLUE    0x001F
 #define YELLOW  0xFFE0
 
-/* ---------- 背光与复位 ---------- */
-#define LCD_BL_ON()    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_2, GPIO_PIN_SET)   /* PD2 高电平点亮 */
+/* ---------- 配色约定：白底黑字，与 main.c 的刷新逻辑保持一致 ---------- */
+#define LCD_BG_COLOR   WHITE
+#define LCD_FG_COLOR   BLACK
+
+/* ---------- 字库：8×16 点阵，ASCII 0x20~0x7E 共 95 个字符 ----------
+   由取模软件（PCtoLCD2002，设置"阴码、逐行式、顺向、十六进制"）生成，
+   存为 font_asc2_1608.c；每个字符 16 字节（高字节在上、MSB 在左） */
+extern const uint8_t asc2_1608[95][16];
+
+/* ---------- 背光：PD2，高电平点亮 ---------- */
+#define LCD_BL_ON()    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_2, GPIO_PIN_SET)
 #define LCD_BL_OFF()   HAL_GPIO_WritePin(GPIOD, GPIO_PIN_2, GPIO_PIN_RESET)
 
+/* ---------- 对外接口 ---------- */
 void LCD_Init(void);
 void LCD_OpenWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h);
 void LCD_SetCursor(uint16_t x, uint16_t y);
 void LCD_DrawPoint(uint16_t x, uint16_t y, uint16_t color);
 void LCD_Fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color);
 void LCD_Clear(uint16_t color);
+void LCD_ShowChar(uint16_t x, uint16_t y, char ch, uint16_t color, uint16_t bgcolor);
+void LCD_ShowString(uint16_t x, uint16_t y, uint16_t maxW,
+                    uint16_t color, uint16_t bgcolor, const char *str);
 
 #endif
 ```
@@ -393,72 +410,126 @@ void LCD_Clear(uint16_t color);
 #include "bsp_lcd.h"
 
 /**
-  * @brief  NT35510 寄存器初始化序列
-  * @note   这段"命令 + 参数"序列由屏厂给出，含义包括：
-  *         解除命令保护、配置内部电源/伽马/时序参数、设置 RGB565 像素格式、
-  *         设置显示方向（0x36）、开显示（0x29）等。
-  *         逐条含义可查《NT35510 数据手册》对应寄存器，工程上直接照抄即可。
+  * @brief  厂商专用初始化表：一条命令 + 若干个参数
+  * @note   NT35510 这类控制器都有一大段"电源/伽马/时序"私有寄存器，
+  *         必须以屏厂随屏资料给出的序列为准逐条填入。这里用"命令 + 参数数组"的
+  *         表结构描述它，好处是新增/删除条目时不必改动任何逻辑代码。
+  *         下面第一条只是用来演示表结构的写法（NT35510 的 CMD2 页选择），
+  *         实际工程请把屏厂序列的每一条都照抄成一行。
   */
-static void LCD_REG_Config(void)
+typedef struct {
+  uint16_t cmd;
+  uint8_t  nArgs;
+  uint16_t args[10];
+} lcd_cmd_t;
+
+static const lcd_cmd_t lcd_vendor_init[] = {
+  /* {命令, 参数个数, {参数...}} —— 示例：进入厂商寄存器页（CMD2EN） */
+  {0xF000, 5, {0x55, 0xAA, 0x52, 0x08, 0x01}},
+  /* ……其余电源、伽马、时序条目按屏厂资料逐行填入…… */
+};
+
+/* 按表依次发送命令及其参数 */
+static void LCD_WriteCmdList(const lcd_cmd_t *list, uint16_t count)
 {
-  /* 解除写保护（CMD page select） */
-  LCD_WRITE_CMD(0xF000); LCD_WRITE_DATA(0x55);
-  LCD_WRITE_DATA(0xAA);  LCD_WRITE_DATA(0x52);
-  LCD_WRITE_DATA(0x08);  LCD_WRITE_DATA(0x01);
+  uint16_t i;
+  uint8_t  j;
 
-  /* ……（其余电源、伽马、时序寄存器序列按屏厂资料照抄，共数十条，此处省略）…… */
-
-  /* 像素格式：RGB565（COLMOD = 0x3A，参数 0x55 = 16bit/pixel） */
-  LCD_WRITE_CMD(0x3A);   LCD_WRITE_DATA(0x55);
-
-  /* 显示方向（MADCTL = 0x36）：0x00 竖屏 / 0x60 横屏，按安装方向调整 */
-  LCD_WRITE_CMD(0x36);   LCD_WRITE_DATA(0x60);
-
-  /* 开显示 */
-  LCD_WRITE_CMD(0x11);   /* Sleep Out */
-  HAL_Delay(120);        /* 手册要求退睡眠后至少等 120ms */
-  LCD_WRITE_CMD(0x29);   /* Display ON */
+  for (i = 0; i < count; i++)
+  {
+    LCD_WRITE_CMD(list[i].cmd);
+    for (j = 0; j < list[i].nArgs; j++)
+    {
+      LCD_WRITE_DATA(list[i].args[j]);
+    }
+  }
 }
 
 /**
-  * @brief  LCD 总初始化：硬件复位 → FSMC 已就绪 → 寄存器配置 → 开背光
+  * @brief  NT35510 寄存器初始化：厂商序列 + 标准 DCS 命令
+  * @note   标准命令（0x3A/0x36/0x11/0x29）是 MIPI DCS 规范定义的，
+  *         任何一家屏都通用；厂商序列只影响画质（伽马、电压），
+  *         即使暂时没有屏厂资料，靠这几条标准命令也能点亮出基本画面
+  */
+static void LCD_REG_Config(void)
+{
+  LCD_WRITE_CMD(0x01);                     /* 软件复位 */
+  HAL_Delay(120);                          /* 手册要求复位后等待 */
+
+  LCD_WriteCmdList(lcd_vendor_init,
+                   sizeof(lcd_vendor_init) / sizeof(lcd_vendor_init[0]));
+
+  LCD_WRITE_CMD(0x3A);  LCD_WRITE_DATA(0x55);   /* 像素格式 = RGB565（16bit/pixel） */
+  LCD_WRITE_CMD(0x36);  LCD_WRITE_DATA(0x60);   /* MADCTL 显示方向：0x00 竖屏 / 0x60 横屏 */
+  LCD_WRITE_CMD(0x11);                          /* Sleep Out */
+  HAL_Delay(120);
+  LCD_WRITE_CMD(0x29);                          /* Display ON */
+}
+
+/**
+  * @brief  LCD 总初始化：关背光 → 复位等待 → 寄存器配置 → 清屏 → 开背光
   * @note   调用前必须已完成 MX_FSMC_Init() 与 MX_GPIO_Init()
   */
 void LCD_Init(void)
 {
-  LCD_BL_OFF();            /* 先关背光，避免初始化期间看到乱码 */
-  HAL_Delay(10);           /* 若 RST 接了 SYS_RSTA，系统复位已完成屏幕复位；
-                              否则在此对 RST GPIO 输出 10ms 低电平再拉高 */
+  LCD_BL_OFF();            /* 先关背光，避免初始化期间看到乱码/闪白 */
+  HAL_Delay(20);           /* RST 接 SYS_RSTA 时屏幕随系统复位已复位；
+                              若另接普通 GPIO，请在此处输出 10ms 低电平再拉高 */
   LCD_REG_Config();
-  LCD_Clear(BLACK);
-  LCD_BL_ON();             /* 初始化完成，点亮背光 */
+  LCD_Clear(LCD_BG_COLOR); /* 清成约定背景色，后续 main.c 不必再清屏 */
+  LCD_BL_ON();
 }
 
 /**
-  * @brief  开显示窗口：设置 GRAM 写入的坐标范围（命令 0x2A/0x2B）
-  * @note   窗口内像素地址自动递增，开窗后连续写像素即可逐点填充
+  * @brief  开显示窗口：设置 GRAM 写入的坐标范围（命令 0x2A / 0x2B）
+  * @note   开窗后连续写像素，NT35510 内部地址自动递增；越界参数直接丢弃，
+  *         避免 w-1 / h-1 下溢成 0xFFFF 把坐标写成天文数字
   */
 void LCD_OpenWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 {
-  LCD_WRITE_CMD(0x2A);                 /* 设置 X 坐标范围 */
-  LCD_WRITE_DATA(x >> 8);
-  LCD_WRITE_DATA(x & 0xFF);
-  LCD_WRITE_DATA((x + w - 1) >> 8);
-  LCD_WRITE_DATA((x + w - 1) & 0xFF);
+  uint16_t x2, y2;
 
-  LCD_WRITE_CMD(0x2B);                 /* 设置 Y 坐标范围 */
-  LCD_WRITE_DATA(y >> 8);
-  LCD_WRITE_DATA(y & 0xFF);
-  LCD_WRITE_DATA((y + h - 1) >> 8);
-  LCD_WRITE_DATA((y + h - 1) & 0xFF);
+  if (w == 0 || h == 0) return;
+  if (x >= LCD_WIDTH || y >= LCD_HEIGHT) return;
+
+  /* 裁掉超出屏幕的部分，保证窗口合法 */
+  if ((uint32_t)x + w > LCD_WIDTH)  w = LCD_WIDTH  - x;
+  if ((uint32_t)y + h > LCD_HEIGHT) h = LCD_HEIGHT - y;
+  x2 = x + w - 1;
+  y2 = y + h - 1;
+
+  LCD_WRITE_CMD(0x2A);                     /* X 坐标范围 */
+  LCD_WRITE_DATA(x  >> 8); LCD_WRITE_DATA(x  & 0xFF);
+  LCD_WRITE_DATA(x2 >> 8); LCD_WRITE_DATA(x2 & 0xFF);
+
+  LCD_WRITE_CMD(0x2B);                     /* Y 坐标范围 */
+  LCD_WRITE_DATA(y  >> 8); LCD_WRITE_DATA(y  & 0xFF);
+  LCD_WRITE_DATA(y2 >> 8); LCD_WRITE_DATA(y2 & 0xFF);
+}
+
+/**
+  * @brief  把"待写入点"定位到 (x,y)：只开 1×1 的窗口，不发 0x2C
+  * @note   调用后需自行发送 LCD_WRITE_CMD(0x2C) 再写数据
+  */
+void LCD_SetCursor(uint16_t x, uint16_t y)
+{
+  LCD_OpenWindow(x, y, 1, 1);
 }
 
 /**
   * @brief  在窗口内填充单一颜色
+  * @note   一次开窗 + 连续写像素，是最高效的填充方式
   */
 void LCD_Fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color)
 {
-  uint32_t total = (uint32_t)w * h;
+  uint32_t total;
+
+  if (w == 0 || h == 0) return;
+  if (x >= LCD_WIDTH || y >= LCD_HEIGHT) return;
+  if ((uint32_t)x + w > LCD_WIDTH)  w = LCD_WIDTH  - x;
+  if ((uint32_t)y + h > LCD_HEIGHT) h = LCD_HEIGHT - y;
+
+  total = (uint32_t)w * h;
 
   LCD_OpenWindow(x, y, w, h);
   LCD_WRITE_CMD(0x2C);                 /* Memory Write：之后的数据进 GRAM */
@@ -473,20 +544,75 @@ void LCD_Clear(uint16_t color)
   LCD_Fill(0, 0, LCD_WIDTH, LCD_HEIGHT, color);
 }
 
+/**
+  * @brief  画一个点
+  * @note   每次调用都要重发 0x2A/0x2B/0x2C 共 13 次总线写，
+  *         是"像素成本"的 13 倍。只有零星画点才用它，
+  *         成片绘图请用 LCD_Fill 或按字符/图像开窗
+  */
 void LCD_DrawPoint(uint16_t x, uint16_t y, uint16_t color)
 {
   if (x >= LCD_WIDTH || y >= LCD_HEIGHT) return;
-  LCD_OpenWindow(x, y, 1, 1);
+
+  LCD_SetCursor(x, y);
   LCD_WRITE_CMD(0x2C);
   LCD_WRITE_DATA(color);
+}
+
+/**
+  * @brief  显示一个 ASCII 字符（8×16 点阵）
+  * @note   按"整字符开一次 8×16 窗口"的方式写，而不是逐像素 LCD_DrawPoint——
+  *         这样 128 个像素只花 1 次开窗（12 次写）+ 1 次 0x2C + 128 次数据写，
+  *         而逐点方式要 128 次开窗，开销差 13 倍
+  */
+void LCD_ShowChar(uint16_t x, uint16_t y, char ch, uint16_t color, uint16_t bgcolor)
+{
+  const uint8_t *font;
+  uint8_t  row, bit;
+  uint8_t  data;
+
+  if (ch < ' ' || ch > '~') ch = ' ';      /* 不可显示的字符统一打成空格 */
+  if ((uint32_t)x + 8 > LCD_WIDTH || (uint32_t)y + 16 > LCD_HEIGHT) return;
+
+  font = asc2_1608[(uint8_t)ch - 0x20];
+
+  LCD_OpenWindow(x, y, 8, 16);
+  LCD_WRITE_CMD(0x2C);
+  for (row = 0; row < 16; row++)
+  {
+    data = font[row];                      /* 一行 8 个像素，MSB 在左 */
+    for (bit = 0; bit < 8; bit++)
+    {
+      LCD_WRITE_DATA((data & (0x80 >> bit)) ? color : bgcolor);
+    }
+  }
+}
+
+/**
+  * @brief  显示字符串（遇 '\0' 结束；超过 maxW 宽度自动截断）
+  * @param  maxW: 本行允许占用的最大宽度（像素），必须是 8 的整数倍才不出现半个字符
+  */
+void LCD_ShowString(uint16_t x, uint16_t y, uint16_t maxW,
+                    uint16_t color, uint16_t bgcolor, const char *str)
+{
+  uint16_t chars = maxW / 8;
+
+  while (chars-- && *str != '\0')
+  {
+    LCD_ShowChar(x, y, *str, color, bgcolor);
+    x += 8;
+    str++;
+  }
 }
 ```
 
 **要点分析**：
 
-- `LCD_WRITE_DATA()` 一行 C 代码背后就是一次完整的 FSMC 写周期（NE1 拉低、A17=1、NWE 脉冲），**命令与数据的区别完全由地址决定**，代码里看不到任何电平操作；
-- `LCD_Fill()` 里的 `while` 循环是 CPU 占用大户：854×480 整屏 409920 个像素，逐点用 CPU 写要花几十毫秒——这正是第 8 章引入 DMA 的原因；
-- 字符/字符串显示函数（取模点阵逐点画点）篇幅所限不展开，工程上直接移植屏厂配套字库即可，底层就是 `LCD_DrawPoint()`。
+- `LCD_WRITE_DATA()` 一行 C 代码背后就是一次完整的 FSMC 写周期（NE1 拉低、A17=1、NWE 脉冲，约 83ns），**命令与数据的区别完全由地址决定**，代码里看不到任何电平操作；
+- **开窗是一次"贵"操作**（12 次总线写），所以驱动设计的核心原则是"**尽量少开窗、每次多写**"：`LCD_Fill()` 一次开窗写几万个像素；`LCD_ShowChar()` 按字符开窗；只有 `LCD_DrawPoint()` 这种零星场合才"一点一开窗"，它比批量写慢约 13 倍——用它画整屏会明显卡顿；
+- `LCD_Fill()` 整屏 409920 个像素 × 83ns ≈ **34ms**，且全程占用 CPU——这正是第 8 章引入 DMA 的动机；
+- 字库文件 `font_asc2_1608.c` 由取模软件生成（PCtoLCD2002：阴码、逐行式、顺向、十六进制），是一个 `const uint8_t asc2_1608[95][16]` 的常量数组，不占用 RAM、直接放在 Flash 里；也可以用屏厂/教程自带的字库文件，只要点阵格式与 `LCD_ShowChar()` 的取模顺序一致即可；
+- 全部显示函数都做了边界裁剪，传错坐标时最多"不显示"，不会把 GRAM 写成乱码。
 
 ---
 
@@ -500,14 +626,26 @@ void LCD_DrawPoint(uint16_t x, uint16_t y, uint16_t color)
 传感器 ──软件I2C──> 器件驱动 Read 函数 ──> 全局数据缓存 ──> 格式化字符串 ──> LCD 字符显示函数 ──> FSMC 写 GRAM
 ```
 
-核心约定：主循环每 1 秒采集一轮传感器数据存入结构体，然后用 `sprintf` 格式化、`LCD_ShowString()` 在固定行显示。**为了避免整屏清屏造成的闪烁，只刷新数值区域**（先用背景色填充该矩形区域，再画字符）。
+复用的器件层接口（与《IIC 通信》笔记 9.2.3 节完全一致，本笔记不再改动）：
+
+**表 7-1 从 IIC 笔记复用的器件层接口**
+
+| 器件 | 初始化 | 读取 | 返回值的坑 |
+| --- | --- | --- | --- |
+| BH1750 光照 | `BH1750_Init()` | `float BH1750_ReadLux()` | 读取失败返回 **-1.0** |
+| HTU21D 温湿度 | `HTU21D_Init()` | `float HTU21D_ReadTemp()` / `HTU21D_ReadHumidity()` | 同上 |
+| PCF8563 时钟 | —（无需初始化） | `void PCF8563_ReadTime(PCF8563_Time_t *)` | 需配合 `PCF8563_IsTimeValid()` 判断掉电 |
+| LIS3DH 三轴 | `uint8_t LIS3DH_Init()` | `void LIS3DH_ReadAcc(short *acc)` | 初始化返回 0 表示 WHO_AM_I 不匹配（没接好） |
+
+核心约定：主循环每 1 秒采集一轮传感器数据，`sprintf` 格式化后**整行重写**（先铺背景色、再画字符）到 LCD 的固定行。整行重写比"精确擦除差异位"简单得多，且天然不会残留旧字符。
 
 ### 7.2 编程要点
 
-1. **数据采集与显示刷新分离**：BH1750 测量需 120ms、HTU21D 需 16~50ms，加上软件 I2C 全程占用 CPU，一轮采集约 200ms——这期间不要碰 LCD；采集完一次性刷新；
-2. **只刷数值、不刷标题**：标题文字（"光照 lx"）只在 `LCD_Init()` 后画一次，循环里仅更新数值行，屏幕完全不闪；
-3. **数值变化才去写屏**：可再进一步加"与上一帧相同则跳过"，降低 FSMC 写次数；
-4. **软件 I2C 与 LCD 无硬件冲突**：软件 I2C 用 PA0/PA1 两个普通 GPIO，FSMC 用 PD/PE 口的 AF12 引脚，互不干扰——这是"FSMC + 软件 I2C"组合比"SPI 屏 + 硬件 I2C"更省心的地方。
+1. **一轮采集 ≈ 70ms**：HTU21D 在 No Hold 模式下每次测量要主机自己等（温度 50ms、湿度 16ms），BH1750 用的是连续测量模式、随时读都是最新值，PCF8563/LIS3DH 都是即读即得。这 70ms 是 `HAL_Delay()` 空转，**正好可以让 DMA 刷屏与它并行**（见第 8 章）——这是本工程里 DMA 收益最实在的一处；
+2. **整行重写、先铺背景**：每行刷新时先用 `LCD_Fill()` 铺一遍背景色再画字符串，避免"新数值比旧数值短、尾巴残留旧数字"的经典问题（例如光照从 `1234.5` 掉到 `9.8`，若不清背景，屏幕上会留下 `9.8` 后面半截旧数字）。若想减少写入量，可把标签与数值分区：标签画一次不再动，数值区用**定宽格式**（`%7.1f`、`%6d`）保证每次宽度相同；
+3. **别用 CPU 阻塞写把采集流程切开**：软件 I2C 采集期间 CPU 是满负荷的，中间插一段 `LCD_Fill`/`LCD_ShowString` 只会拉长采集时间。刷新只有两种合理姿势：① 采集完成后一次性刷完（第 6 章的方式，简单直接）；② 用第 8 章的 DMA 在 `HAL_Delay()` 等待窗口里发起（异步搬运，CPU 不参与）——**注意二者的区别是"谁在执行"，不是"什么时候做"**；
+4. **软件 I2C 与 LCD 无硬件冲突**：软件 I2C 用 PA0/PA1 两个普通 GPIO，FSMC 用 PD/PE 口的 AF12 引脚，互不干扰——这是"FSMC + 软件 I2C"组合比"SPI 屏 + 硬件 I2C"更省心的地方；
+5. **把传感器状态画到屏上**：`LIS3DH_Init()` 的返回值、`PCF8563_IsTimeValid()` 的结果都直接显示出来，"哪个模块没接好"一眼可见，不必连串口。
 
 ### 7.3 代码分析
 
@@ -516,69 +654,87 @@ void LCD_DrawPoint(uint16_t x, uint16_t y, uint16_t color)
 ```c
 #include "bsp_lcd.h"
 #include "bsp_soft_i2c.h"
+#include "bsp_sensor_io.h"
 #include "bsp_bh1750.h"
 #include "bsp_htu21d.h"
 #include "bsp_pcf8563.h"
 #include "bsp_lis3dh.h"
 #include <stdio.h>
 
-/* 显示用的行号约定（字符高 16 像素，行距 24 像素） */
+/* 显示布局：顶部一行标题独占，其下 5 行数据；字符高 16 像素、行距 24 像素 */
 #define ROW_TIME    0
 #define ROW_LUX     1
 #define ROW_TEMP    2
 #define ROW_HUM     3
 #define ROW_ACC     4
 
-/* 在固定行刷新一段文字：先用背景色盖掉旧值，再写新字符串 */
+#define ROW_X       8                       /* 行起始 x 坐标 */
+#define ROW_W       320                     /* 每行刷新区域宽度（= 40 字符） */
+#define ROW_H       16                      /* 字高 */
+#define TITLE_Y     8                       /* 标题行 y 坐标：独占顶部，不被数据刷新覆盖 */
+#define ROW_Y(r)    (48 + (r) * 24)         /* 数据行 y 坐标：上方 40 像素留给标题 */
+
+/* 刷新一行：先铺背景色彻底清掉旧内容，再写新字符串 */
 static void LCD_RefreshRow(uint8_t row, const char *str)
 {
-  LCD_ShowString(8, 8 + row * 24, LCD_WIDTH - 16, 16, 16, (char *)str);
-  /* LCD_ShowString 内部：对字符点阵逐位 LCD_DrawPoint，背景色填非笔画像素 */
+  LCD_Fill(ROW_X, ROW_Y(row), ROW_W, ROW_H, LCD_BG_COLOR);
+  LCD_ShowString(ROW_X, ROW_Y(row), ROW_W, LCD_FG_COLOR, LCD_BG_COLOR, str);
+}
+
+/* 画标题：只在上电时画一次；数据行从 y=48 起，不会覆盖它 */
+static void LCD_DrawTitle(void)
+{
+  LCD_ShowString(ROW_X, TITLE_Y, ROW_W, LCD_FG_COLOR, LCD_BG_COLOR,
+                 "----- I2C Sensor Monitor -----");
 }
 
 int main(void)
 {
   float lux, temp, hum;
-  short acc[3];
+  short acc[3] = {0, 0, 0};
   PCF8563_Time_t now;
   char buf[48];
+  uint8_t lisOk, timeOk;
 
   HAL_Init();
   SystemClock_Config();        /* 168MHz，HCLK=168MHz 供 FSMC */
-  MX_GPIO_Init();              /* 含 PD2 背光、PA1/PA0 软件I2C 开漏 */
-  MX_FSMC_Init();              /* NE1 + A17，模式B，16位 */
-  MX_USART1_UART_Init();       /* 可选：串口同步打印便于对照 */
+  MX_GPIO_Init();              /* 含 PD2 背光、PA1/PA0 软件 I2C 开漏 */
+  MX_FSMC_Init();              /* NE1 + A17，模式 B，16 位 */
+  MX_USART1_UART_Init();       /* 可选：串口同步打印，便于对照 */
 
-  I2C_Init();                  /* 软件 I2C 总线空闲 */
-  LCD_Init();                  /* LCD 复位 + NT35510 寄存器配置 + 开背光 */
+  I2C_Init();                  /* 软件 I2C 总线释放为空闲高电平 */
+  LCD_Init();                  /* LCD 复位 + NT35510 配置 + 清屏 + 开背光 */
 
-  /* ---------- 传感器初始化（与 IIC 笔记 9.2.3 节相同） ---------- */
+  /* ---------- 传感器初始化（复用 IIC 笔记 9.2.3 节的器件层） ---------- */
   BH1750_Init();
   HTU21D_Init();
-  LIS3DH_Init();
+  lisOk  = LIS3DH_Init();              /* 1 = 读到 WHO_AM_I = 0x33，器件在线 */
+  timeOk = PCF8563_IsTimeValid();      /* 1 = 时间可信，0 = 曾掉电 */
 
-  /* ---------- 画静态标题（只画一次，此后循环不清屏） ---------- */
-  LCD_Clear(WHITE);
-  LCD_ShowString(8, 8 + ROW_TIME * 24, 300, 16, 16, "Time : --:--:--");
-  LCD_ShowString(8, 8 + ROW_LUX  * 24, 300, 16, 16, "Lux  : -----.- lx");
-  LCD_ShowString(8, 8 + ROW_TEMP * 24, 300, 16, 16, "Temp : ---.-- C");
-  LCD_ShowString(8, 8 + ROW_HUM  * 24, 300, 16, 16, "Humi : ---.-- %RH");
-  LCD_ShowString(8, 8 + ROW_ACC  * 24, 300, 16, 16, "Acc  : X=---- Y=---- Z=----");
+  LCD_DrawTitle();
 
   while (1)
   {
-    /* 1. 一轮采集（软件 I2C，约 200ms，CPU 占用集中在这一段） */
+    /* 1. 一轮采集：软件 I2C，约 70ms，CPU 全程占用（其中约 66ms 是 HAL_Delay 空转） */
     lux  = BH1750_ReadLux();
     temp = HTU21D_ReadTemp();
     hum  = HTU21D_ReadHumidity();
     PCF8563_ReadTime(&now);
     LIS3DH_ReadAcc(acc);
 
-    /* 2. 逐行刷新数值（sprintf 格式化到字符串，再刷屏） */
-    sprintf(buf, "Time : 20%02d-%02d-%02d %02d:%02d:%02d",
-            now.year, now.month, now.day, now.hour, now.min, now.sec);
+    /* 2. 逐行刷新：sprintf 格式化 → 清背景 → 写字符串 */
+    if (timeOk)
+    {
+      sprintf(buf, "Time : 20%02d-%02d-%02d %02d:%02d:%02d",
+              now.year, now.month, now.day, now.hour, now.min, now.sec);
+    }
+    else
+    {
+      sprintf(buf, "Time : TIME LOST (no battery)");
+    }
     LCD_RefreshRow(ROW_TIME, buf);
 
+    /* 读取失败时驱动返回负值，屏幕上会出现明显的负数——这是最好的自检 */
     sprintf(buf, "Lux  : %7.1f lx", lux);
     LCD_RefreshRow(ROW_LUX, buf);
 
@@ -588,19 +744,27 @@ int main(void)
     sprintf(buf, "Humi : %7.2f %%RH", hum);
     LCD_RefreshRow(ROW_HUM, buf);
 
-    sprintf(buf, "Acc  : X=%6d Y=%6d Z=%6d", acc[0], acc[1], acc[2]);
+    if (lisOk)
+    {
+      sprintf(buf, "Acc  : X=%6d Y=%6d Z=%6d", acc[0], acc[1], acc[2]);
+    }
+    else
+    {
+      sprintf(buf, "Acc  : LIS3DH NOT FOUND");
+    }
     LCD_RefreshRow(ROW_ACC, buf);
 
-    HAL_Delay(800);            /* 采集约耗 200ms，凑整 1 秒一轮 */
+    HAL_Delay(900);              /* 采集约 70ms，凑整 1 秒一轮 */
   }
 }
 ```
 
 **分析**：
 
-- 数据链路是"**器件驱动 → float/结构体 → sprintf → LCD_ShowString → LCD_DrawPoint → FSMC 写 GRAM**"，I2C 与 LCD 完全解耦，任何一边出问题都能单独定位；
-- `LCD_ShowString()` 是标准的取模显示函数（网上任一 STM32 LCD 教程都有），内部对非笔画像素填背景色，因此重复刷新同一行无需先清屏；
-- 若个别传感器未接，相应 Read 函数返回值会停在物理不合理处（如 BH1750 返回 -1），屏幕上会显示负值，一眼能看出来——这比"黑屏"友好得多。
+- 数据链路是"**器件驱动 → float/结构体 → sprintf → LCD_ShowString → FSMC 写 GRAM**"，I2C 与 LCD 完全解耦，任何一边出问题都能单独定位；
+- 每次刷新一行 = 铺背景（320×16 = 5120 像素）+ 写字符（33 字符 × 128 像素 ≈ 4224 像素），共约 9300 次 FSMC 写 ≈ **0.8ms**；5 行合计约 4ms/秒，CPU 占用约 0.4%——**这也是"要不要为刷屏上 DMA"的判断依据：本工程 DMA 省下的 CPU 时间只有几毫秒/秒，收益有限，真正的价值在"把这 4ms 藏进 I2C 的等待里"以及将来做波形/图片显示时的可扩展性**（见第 8 章）；
+- **注意"每行都铺背景"与"写入量"的权衡**：铺背景会把整行的空白像素也写一遍（5120 像素里真正有字的只有约 4224 个），换来的是"绝不留残影"。若刷屏区域更大、刷新更频繁，就该改用"标签画一次 + 数值定宽刷新"的方案（要点 2）；
+- 若个别传感器未接，屏幕上会显示负数或 `NOT FOUND`，一眼能看出来——这比"黑屏"友好得多。
 
 ---
 
@@ -610,13 +774,20 @@ int main(void)
 
 本应用中 CPU 的开销主要有三块：
 
+**表 8-1 每秒的 CPU 开销（按 168MHz、FSMC 一次 16 位写约 83ns 估算）**
+
 | 环节 | 耗时量级 | 能否优化 |
 | --- | --- | --- |
-| 软件 I2C 采集一轮（4 个传感器） | ~200ms / 秒 | 软件 I2C 本质是 CPU 翻转 GPIO，**只能用改硬件 I2C（PB8/PB9）或拉长采集周期来降** |
-| 逐点写 LCD 数值字符（5 行 × 约 30 字符） | 每字符 12×16=192 像素，共约 3 万像素 × 一次 FSMC 写 | **DMA 可接管**（见 8.2） |
-| sprintf 格式化 | 几十 µs | 可忽略 |
+| 软件 I2C 采集一轮（4 个传感器） | ≈70ms / 秒，其中约 66ms 是 HTU21D No Hold 模式下的 `HAL_Delay()` 空转 | 等待期间 CPU 完全空闲，**正好可以让 DMA 刷屏并行填进去**（见 8.5 节）；要彻底降下来只能把总线改到 PB8/PB9 用硬件 I2C + DMA 收数（《IIC 通信》笔记第 7 章） |
+| 逐行刷屏（5 行 × 320×16 区域 ≈ 4.7 万次 FSMC 写） | ≈4ms / 秒（约占 CPU 的 0.4%） | **DMA 可接管**（见 8.2） |
+| `sprintf` 格式化 | 几十 µs | 可忽略 |
 
-其中软件 I2C 的 200ms 是"物理时序"开销，无法消除（除非把传感器总线改接到 PB8/PB9 换硬件 I2C + DMA 收数，见《IIC 通信》笔记第 7 章）；而 LCD 刷屏这一环，**FSMC 本身不产生 DMA 请求**（它是存储器接口不是外设请求源），但可以用 **DMA2 的内存到内存（M2M）模式**把内部 SRAM 中的帧缓冲整块搬到 FSMC 映射地址，CPU 只负责"发起"，搬运过程零占用。
+**先给个结论**：以本工程每秒刷 5 行的规模，刷屏只占 CPU 的 0.4%，**"为了省这 4ms 而上 DMA"本身收益很小**。DMA 在这里的真正价值有两处：
+
+1. **把搬运时间藏进 I2C 的等待窗口**——发起 DMA 后 CPU 立即去执行 HTU21D 的 50ms 等待，两者并行，等于刷屏"不要钱"；
+2. **可扩展性**——一旦要做波形刷新、图片显示、滑动菜单，刷屏时间会涨到几十毫秒量级，那时 DMA 就是必需品，代码结构越早搭好越省事。
+
+FSMC 本身**不产生 DMA 请求**（它是存储器接口，不是外设请求源），所以不能像 ADC/UART 那样"外设请求 DMA"。但可以用 **DMA2 的内存到内存（M2M）模式**把内部 SRAM 中的帧缓冲整块搬到 FSMC 映射地址——CPU 只负责"发起"，搬运过程零占用。
 
 ### 8.2 DMA 内存到内存搬运的原理
 
@@ -624,109 +795,281 @@ int main(void)
 
 1. 在内部 SRAM 里建一块**局部帧缓冲**（如一行文字区域的像素数组）；
 2. 先在帧缓冲里把字符点阵渲染好（写内部 RAM，速度极快）；
-3. 开窗（`LCD_OpenWindow`）后，启动 DMA2 M2M 传输，源 = 帧缓冲，目的 = `LCD_DATA_ADDR`；
-4. DMA 控制器自动把整段像素灌进 GRAM，CPU 在这期间可以去干别的（比如开始下一轮 I2C 采集的等待延时——**DMA 传输与软件 I2C 延时可以重叠**，这是实打实的并行收益）。
+3. 开窗（`LCD_OpenWindow`）+ 发 `0x2C` 后，启动 DMA2 M2M 传输，源 = 帧缓冲，目的 = `LCD_DATA_ADDR`；
+4. DMA 控制器自动把整段像素灌进 GRAM，**CPU 在这期间立刻返回**去干别的（比如执行下一轮 I2C 采集里的 `HAL_Delay()`）。
+
+> **必须警惕的一个语义陷阱（本笔记早期版本的错误就出在这里）**：在 STM32F4 的 HAL 里，M2M 模式的**源地址被写进 PAR（外设端口寄存器）、目的地址被写进 M0AR（内存端口寄存器）**，也就是"**源 = Peripheral，目的 = Memory**"。所以：
+>
+> - `HAL_DMA_Start_IT(hdma, (uint32_t)帧缓冲, LCD_DATA_ADDR, 像素数)` 中，**帧缓冲进 PAR、LCD 数据口进 M0AR**；
+> - **自增位要按这个映射来配**：`PeriphInc`（PINC）控制的是 **PAR 即源地址** → 必须 **ENABLE**（帧缓冲要逐个像素往后走）；`MemInc`（MINC）控制的是 **M0AR 即目的地址** → 必须 **DISABLE**（LCD 数据口地址固定不动，像素地址递增由 NT35510 内部完成）。
+>
+> **如果按"直觉"把两者配反**（源不自增、目的自增），现象是：屏幕只显示第一个像素的颜色，或者干脆花屏/跑飞——因为 DMA 会拿同一个像素反复写 GRAM，同时把 LCD 数据口地址当数组往后"踩"。**这是 M2M 驱动 LCD 最容易踩的坑。**
+
+其他几条约束：
+
+- **M2M 模式严禁使用 Circular**（参考手册明确禁止），只能用 Normal：搬完即停；
+- M2M 传输会占用 AHB 总线带宽，传输期间 CPU 访问 RAM/Flash 会被仲裁插入等待，所以 **DMA 并不会缩短墙钟时间，它缩短的是"CPU 被占用时间"**；
+- 本工程未用 ADC；若将来把它与《ADC 采集配置》笔记合并，注意那边 **ADC1 用的是 DMA2 Stream0**，与本章冲突——需要给其中一个换 Stream（ADS 用 Stream0，LCD 用 Stream1）或复用同一个流并分时启动。
 
 ### 8.3 CubeMX 配置 DMA2
 
-1. **System Core → DMA** → **MemToMem** → 点击 **Add**，自动生成 `hdma_memtomem_dma2_stream0`；
-2. 参数：Mode = **Normal**，Increment Address = **两端都打勾**？——**注意：目的端不能自增**！FSMC 的数据端口是固定地址 `LCD_DATA_ADDR`，每写一个像素 NT35510 内部地址自增，所以 **Peripheral（目的，即 LCD_DATA_ADDR）不自增、Memory（源，帧缓冲）自增**。M2M 模式下 CubeMX 面板简化为：Data Width = Half Word，Priority = High；
-3. NVIC 勾选 **DMA2 Stream0 global interrupt**（用回调判断搬运完成）。
+1. **System Core → DMA** → **MemToMem** → 点击 **Add**，CubeMX 生成 `hdma_memtomem_dma2_stream0`，勾选 **DMA2 Stream0 global interrupt**；
+2. **parameter 里注意两件事**：① Mode 必须 **Normal**（M2M 不支持 Circular）；② **源、目的的自增设置**——CubeMX 的 MemToMem 面板在部分版本里只给一个"Increment Address"选项（两端同设置），**如果它不让你分别设置两端，就直接手写初始化代码**（代码清单 8-1），别硬凑；
+3. 若走 CubeMX 生成：注意 `stm32f4xx_it.c` 里会由 CubeMX 自动加上 `DMA2_Stream0_IRQHandler()`，它会调用 CubeMX 自己的 `hdma_memtomem_dma2_stream0` 句柄——**此时不要再重复定义一次该中断函数**（否则链接报 multiple definition），而是复用 CubeMX 的句柄（在 `MX_DMA_Init()` 之外，把它的 `XferCpltCallback` 换成自己的回调即可）；
+4. 本章 8.4 节给出的代码是**完全手写、不依赖 CubeMX 生成 DMA** 的版本，工程上最省心：只要在 DMA 配置里勾了 NVIC，或者干脆自己在 `LCD_DMA_Init()` 里配 NVIC 都行。
 
-> 若 CubeMX 的 MemToMem 面板不允许区分两端自增（F4 的 M2M 默认两端同设置），就**手工写 DMA 初始化代码**（见代码清单 8-1），不走 CubeMX 的 MemToMem 生成——这在工程上是常规做法。
+### 8.4 代码分析
 
-列表 6: 代码清单 8-1 DMA 刷屏驱动（lcd_dma.c）
+列表 6: 代码清单 8-1 DMA 刷屏驱动（lcd_dma.h / lcd_dma.c）
 
 ```c
+/* lcd_dma.h */
+#ifndef __LCD_DMA_H
+#define __LCD_DMA_H
+
 #include "bsp_lcd.h"
-#include <string.h>
+
+/* 一行文字区域的帧缓冲尺寸（像素） */
+#define LINE_BUF_W   320
+#define LINE_BUF_H   16
+
+void LCD_DMA_Init(void);
+HAL_StatusTypeDef LCD_DMA_FillBuffer(uint16_t x, uint16_t y,
+                                     uint16_t w, uint16_t h,
+                                     const uint16_t *pixels);
+void LCD_ShowString_DMA(uint16_t x, uint16_t y, uint16_t maxW, const char *str);
+
+#endif
+```
+
+```c
+/* lcd_dma.c */
+#include "lcd_dma.h"
 
 static DMA_HandleTypeDef hdma_lcd;
-static volatile uint8_t dma_busy = 0;
+static volatile uint8_t  dma_busy = 0;      /* 1 = 上一次搬运还没结束 */
+
+static void LCD_DMA_CpltCallback(DMA_HandleTypeDef *hdma);
+static void LCD_DMA_ErrorCallback(DMA_HandleTypeDef *hdma);
 
 /**
-  * @brief  手工初始化 DMA2 Stream0：内部RAM → FSMC 数据端口
-  * @note   关键点：源地址自增（像素数组），目的地址固定（LCD_DATA_ADDR），
-  *         NT35510 的 GRAM 地址自增由开窗后连续写自动完成
+  * @brief  初始化 DMA2 Stream0：帧缓冲 → FSMC 数据端口（内存到内存）
+  * @note   关键三点：
+  *         ① M2M 模式下"源 = Peripheral 端（PAR）、目的 = Memory 端（M0AR）"，
+  *            所以 PeriphInc 控源、MemInc 控目的。本应用源要自增、目的固定，
+  *            因此 PeriphInc = ENABLE、MemInc = DISABLE（与直觉相反，详见 8.2 节）
+  *         ② Mode 必须是 Normal，M2M 禁止 Circular
+  *         ③ FIFO 关闭 + 单次突发：M2M 用 FIFO/突发虽能提速，但要求地址按突发
+  *            宽度对齐，且 FIFO 门槛设置不当时易出现"传一半停住"。FSMC 本就是
+  *            慢速从设备，省这点时间没有意义，稳定性优先
   */
 void LCD_DMA_Init(void)
 {
   __HAL_RCC_DMA2_CLK_ENABLE();
 
   hdma_lcd.Instance                 = DMA2_Stream0;
-  hdma_lcd.Init.Channel             = DMA_CHANNEL_0;
+  hdma_lcd.Init.Channel             = DMA_CHANNEL_0;          /* M2M 模式下通道号无效 */
   hdma_lcd.Init.Direction           = DMA_MEMORY_TO_MEMORY;
-  hdma_lcd.Init.PeriphInc           = DMA_PINC_DISABLE;    /* 目的固定：FSMC 数据口 */
-  hdma_lcd.Init.MemInc              = DMA_MINC_ENABLE;     /* 源自增：帧缓冲 */
-  hdma_lcd.Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD;
-  hdma_lcd.Init.MemDataAlignment    = DMA_MDATAALIGN_HALFWORD;
+  hdma_lcd.Init.PeriphInc           = DMA_PINC_ENABLE;        /* 【源】帧缓冲逐个像素自增 */
+  hdma_lcd.Init.MemInc              = DMA_MINC_DISABLE;       /* 【目的】LCD 数据口固定不动 */
+  hdma_lcd.Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD;/* 源：16 位（RGB565 一像素） */
+  hdma_lcd.Init.MemDataAlignment    = DMA_MDATAALIGN_HALFWORD;/* 目的：16 位 */
   hdma_lcd.Init.Mode                = DMA_NORMAL;
   hdma_lcd.Init.Priority            = DMA_PRIORITY_HIGH;
-  hdma_lcd.Init.FIFOMode            = DMA_FIFOMODE_ENABLE;
+  hdma_lcd.Init.FIFOMode            = DMA_FIFOMODE_DISABLE;
   hdma_lcd.Init.FIFOThreshold       = DMA_FIFO_THRESHOLD_FULL;
-  hdma_lcd.Init.MemBurst            = DMA_MBURST_INC4;
+  hdma_lcd.Init.MemBurst            = DMA_MBURST_SINGLE;
   hdma_lcd.Init.PeriphBurst         = DMA_PBURST_SINGLE;
-  HAL_DMA_Init(&hdma_lcd);
+
+  if (HAL_DMA_Init(&hdma_lcd) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* 回调必须在 HAL_DMA_Init() 之后挂：F4 的 HAL_DMA_Init 会把句柄里的
+     所有回调指针清空，先挂就等于白挂。若用 HAL_DMA_RegisterCallback()
+     注册，同样要放在 Init 之后 */
+  hdma_lcd.XferCpltCallback  = LCD_DMA_CpltCallback;
+  hdma_lcd.XferErrorCallback = LCD_DMA_ErrorCallback;
 
   HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
 }
 
+/* 搬运完成：解锁 */
+static void LCD_DMA_CpltCallback(DMA_HandleTypeDef *hdma)
+{
+  if (hdma == &hdma_lcd) dma_busy = 0;
+}
+
+/* 搬运出错：也必须解锁，否则一次错误就把接口永久锁死，屏幕从此不再刷新 */
+static void LCD_DMA_ErrorCallback(DMA_HandleTypeDef *hdma)
+{
+  if (hdma == &hdma_lcd) dma_busy = 0;
+}
+
 /**
   * @brief  用 DMA 把一个矩形区域的像素写入 LCD
   * @param  pixels: 内部 SRAM 中的像素数组（RGB565，w*h 个 uint16_t）
-  * @retval HAL_BUSY 表示上一次搬运尚未完成
+  * @retval HAL_BUSY = 上一次搬运尚未完成；其余为 HAL 返回值
+  * @note   注意执行顺序：必须在启动 DMA **之前**开窗并发出 0x2C，
+  *         否则 DMA 灌进去的像素不会被当作 GRAM 数据
   */
 HAL_StatusTypeDef LCD_DMA_FillBuffer(uint16_t x, uint16_t y,
                                      uint16_t w, uint16_t h,
                                      const uint16_t *pixels)
 {
+  HAL_StatusTypeDef st;
+
   if (dma_busy) return HAL_BUSY;
+  if (w == 0 || h == 0) return HAL_ERROR;
+  /* 这里必须自己挡越界：LCD_OpenWindow() 会把窗口裁到屏幕内，
+     而 DMA 的传输个数用的是原始的 w*h——两者不一致时，多出来的像素
+     会写到窗口之外，表现为屏幕右侧/下方出现一条错位色带 */
+  if ((uint32_t)x + w > LCD_WIDTH || (uint32_t)y + h > LCD_HEIGHT) return HAL_ERROR;
+
   dma_busy = 1;
 
   LCD_OpenWindow(x, y, w, h);
-  LCD_WRITE_CMD(0x2C);          /* 开窗 + Memory Write，DMA 只负责灌数据 */
+  LCD_WRITE_CMD(0x2C);          /* 进入 Memory Write，DMA 只负责灌数据 */
 
-  return HAL_DMA_Start_IT(&hdma_lcd, (uint32_t)pixels,
-                          LCD_DATA_ADDR, (uint32_t)w * h);
+  st = HAL_DMA_Start_IT(&hdma_lcd, (uint32_t)pixels,
+                        LCD_DATA_ADDR, (uint32_t)w * h);
+  if (st != HAL_OK)
+  {
+    dma_busy = 0;               /* 启动失败要立即解锁，否则接口再也调不动 */
+  }
+  return st;
 }
 
-/* DMA 完成回调：解锁 */
-void HAL_DMA_XferCpltCallback(DMA_HandleTypeDef *hdma)
-{
-  if (hdma == &hdma_lcd) dma_busy = 0;
-}
-
-/* 中断入口（stm32f4xx_it.c 中也要有同样的转发） */
+/* 中断入口：写在 stm32f4xx_it.c 或本文件（全局只能有一份） */
 void DMA2_Stream0_IRQHandler(void)
 {
   HAL_DMA_IRQHandler(&hdma_lcd);
 }
 ```
 
-列表 7: 代码清单 8-2 用 DMA 显示一行文字（渲染到帧缓冲，再 DMA 灌屏）
+列表 7: 代码清单 8-2 用 DMA 显示一行文字（先在 RAM 里渲染，再整块灌屏）
 
 ```c
-/* 一行文字区域：300 像素宽 × 16 像素高，4800 个 uint16_t ≈ 9.4KB 内部 RAM */
-static uint16_t line_buf[300 * 16];
+#include "lcd_dma.h"
 
-void LCD_ShowString_DMA(uint16_t x, uint16_t y, uint16_t w, const char *str)
+/* 一行文字区域的帧缓冲：320×16 = 5120 像素 = 10KB 内部 SRAM
+   （SRAM1 + SRAM2 共 128KB，放一两行绰绰有余） */
+static uint16_t line_buf[LINE_BUF_W * LINE_BUF_H];
+
+/**
+  * @brief  把字符串渲染进帧缓冲（纯内部 RAM 操作，不碰 FSMC）
+  * @note   字库与 LCD_ShowChar 共用同一份 asc2_1608，取模顺序必须一致：
+  *         每字符 16 字节、逐行、MSB 在左
+  */
+static void LCD_RenderString(uint16_t *buf, uint16_t bufW, uint16_t renderW,
+                             const char *str)
 {
-  /* 1. 在内部 RAM 里渲染字符点阵（写 SRAM，无 FSMC 开销，极快） */
-  uint32_t total = (uint32_t)w * 16;
+  uint32_t total = (uint32_t)bufW * LINE_BUF_H;
   uint32_t i;
-  for (i = 0; i < total; i++) line_buf[i] = WHITE;      /* 背景 */
-  /* ……按字库点阵把笔画像素写成 BLACK（代码略，与 LCD_ShowString 的取模逻辑相同，
-        区别只是写入目标是 line_buf 而不是直接 LCD_DrawPoint）…… */
+  uint16_t chMax = renderW / 8;       /* renderW 内最多几个字符 */
+  uint16_t ch, row, col;
+  uint8_t  data;
+  char     c;
+  const uint8_t *font;
 
-  /* 2. 渲染完成后 DMA 整块灌屏，CPU 立即返回 */
-  while (LCD_DMA_FillBuffer(x, y, w, 16, line_buf) == HAL_BUSY);
+  /* 1. 整行铺背景色（含空白区），保证覆盖掉上一次的内容 */
+  for (i = 0; i < total; i++)
+  {
+    buf[i] = LCD_BG_COLOR;
+  }
+
+  /* 2. 逐字符取模渲染；超出 renderW 的字符直接不画（截断） */
+  for (ch = 0; ch < chMax && str[ch] != '\0'; ch++)
+  {
+    c = str[ch];
+    if (c < ' ' || c > '~') c = ' ';
+
+    font = asc2_1608[(uint8_t)c - 0x20];
+    for (row = 0; row < 16; row++)
+    {
+      data = font[row];
+      for (col = 0; col < 8; col++)
+      {
+        buf[row * bufW + ch * 8 + col] =
+            (data & (0x80 >> col)) ? LCD_FG_COLOR : LCD_BG_COLOR;
+      }
+    }
+  }
+}
+
+/**
+  * @brief  显示一行字符串（渲染到帧缓冲 + DMA 灌屏）
+  * @note   发起 DMA 后本函数就返回了；若下一行要马上刷新，
+  *         需等 dma_busy 清零（下面的兜底等待），或在主循环里让出时间
+  */
+void LCD_ShowString_DMA(uint16_t x, uint16_t y, uint16_t maxW, const char *str)
+{
+  uint32_t guard = 0;
+
+  if (maxW > LINE_BUF_W) maxW = LINE_BUF_W;   /* 缓冲区固定宽度，超了会写穿 */
+  if (maxW == 0) return;
+
+  LCD_RenderString(line_buf, LINE_BUF_W, maxW, str);
+
+  /* 兜底：上一行还在搬就等一会。正常情况这里最多等几十微秒
+     （5120 像素 @ 约 24MB/s 也就 0.2ms），不会成为瓶颈 */
+  while (LCD_DMA_FillBuffer(x, y, maxW, LINE_BUF_H, line_buf) == HAL_BUSY)
+  {
+    if (++guard > 1000000U) break;            /* 异常时不要死等 */
+  }
 }
 ```
 
-**效果对比**：逐点 `LCD_DrawPoint` 写一行 300×16 字符，4800 次 FSMC 写全部由 CPU 执行，约耗时 1~2ms 且全程占用 CPU；DMA 方式下 CPU 只花渲染点阵的时间（写内部 SRAM，一次访存约几个 ns 级指令），4800 个像素的搬运由 DMA 完成，**这 1~2ms 内 CPU 可以并行执行软件 I2C 的位操作**——原本串行的"采集 200ms + 刷屏 10ms"可以压到接近 200ms。
+**要点分析**：
 
-> **进阶方向**：若做波形显示/图片显示等大帧刷新，可把帧缓冲设为半屏或整行，配合 DMA 双缓冲交替渲染与推送，CPU 占用可再降一个数量级。整屏 854×480×2B = 800KB 超过 F407 的 192KB 内部 SRAM，所以**整屏帧缓冲放不下**，必须分行/分块——这也是为什么"局部刷新 + DMA 分行"是 F407 + 大屏的标配姿势。
+1. **`HAL_DMA_Start_IT()` 的源/目的顺序按 M2M 的映射关系写**：第一个参数（源）进 PAR、第二个参数（目的）进 M0AR，自增位与之配对，配反了就花屏（见 8.2 节）；
+2. **回调不是"重定义库函数"**：F4 HAL 里没有可以覆盖的 `HAL_DMA_XferCpltCallback()`，正确做法是把函数指针挂到句柄上（`hdma->XferCpltCallback = …`）或用 `HAL_DMA_RegisterCallback()`，并且**必须在 `HAL_DMA_Init()` 之后挂**；
+3. **完成与出错都要解锁**：只解完成回调、不解出错回调，一次 DMA 错误就会让 `dma_busy` 永久为 1，屏幕"刷新一次之后就再也不动"——这是排查时最容易误判成"屏幕坏了"的软件故障；
+4. **`0x2C` 必须在启动 DMA 之前发**：DMA 只往数据口灌字节，不负责发命令。若顺序反了，屏幕会显示上一次开窗区域的残留内容；
+5. **渲染阶段是纯 RAM 操作**：`LCD_RenderString()` 只写内部 SRAM，不产生任何 FSMC 周期，所以即使没有 DMA，这套"先渲染到缓冲、再一次性写屏"的结构也比"逐点 `LCD_DrawPoint`"快得多（少了 13 倍的开窗开销）。
+
+### 8.5 收益与并行的用法
+
+把 8.4 节的接口接到主循环里，**关键不是"省了多少 CPU"，而是"让 DMA 去跑，CPU 立刻去做 I2C 的等待"**。下面两段只保留与 DMA 相关的关键调用，其余行见第 7 章代码清单 7-1：
+
+```c
+while (1)
+{
+  /* 1. 先采集（HTU21D 内部含 HAL_Delay，是 CPU 空转的窗口） */
+  lux  = BH1750_ReadLux();                      /* 连续模式，即读即得 */
+  temp = HTU21D_ReadTemp();                     /* 内部含 HAL_Delay(50) */
+
+  /* 2. 把这一轮的数据刷到屏上：DMA 搬运，CPU 发起后即可返回 */
+  sprintf(buf, "Temp : %7.2f C", temp);
+  LCD_ShowString_DMA(ROW_X, ROW_Y(ROW_TEMP), ROW_W, buf);
+
+  HAL_Delay(900);
+}
+```
+
+更直白的写法是把刷新**塞进"等待窗口"**里——触发测量后立刻刷屏，让 50ms 等待与搬运并行：
+
+```c
+  /* 触发 No Hold 温度测量，然后在 50ms 等待里完成上一行数据的灌屏 */
+  I2C_WriteCmd(HTU21D_ADDR_W, HTU21D_TRIG_T_NOHOLD);
+  LCD_ShowString_DMA(ROW_X, ROW_Y(ROW_TEMP), ROW_W, buf_temp);  /* 发起即返回 */
+  HAL_Delay(50);                                               /* 等待与搬运并行 */
+  I2C_ReadBytes(HTU21D_ADDR_W, raw, 2);
+```
+
+**两种方式的量化对比**（刷新一行 320×16）：
+
+| 方式 | 墙钟耗时 | CPU 占用 | 说明 |
+| --- | --- | --- | --- |
+| 逐点 `LCD_DrawPoint` | 约 5~6ms | 约 5~6ms | 每像素一次开窗，开销 13 倍，最差 |
+| 按字符开窗 `LCD_ShowString` | 约 0.8ms | 约 0.8ms | 本笔记第 6 章的默认实现，性价比最高 |
+| 渲染 + DMA | 约 0.8ms（渲染 0.3ms + 搬运 0.5ms） | **约 0.3ms** | 墙钟时间几乎不变，但其中 0.5ms 可与 I2C 等待重叠 |
+
+> **结论**：墙钟时间由 FSMC 写周期决定（16 位写 83ns，谁也绕不过），DMA 改变的是"这 0.5ms 由谁在执行"。**所以判断要不要用 DMA 的标准是："刷屏期间 CPU 有没有别的事可做"**——本工程有（I2C 的 66ms 等待），所以值得；如果主循环刷完屏就没事干，用不用都一样。
+
+> **进阶方向**：若做波形显示/图片显示等大帧刷新，可把帧缓冲设为整行或半屏，配合 DMA 双缓冲交替渲染与推送，CPU 占用可再降一个数量级。整屏 854×480×2B = 800KB 超过 F407 的 192KB 内部 SRAM，所以**整屏帧缓冲放不下**，必须分行/分块——这也是为什么"局部刷新 + DMA 分行"是 F407 + 大屏的标配姿势。
 
 ---
 
@@ -734,11 +1077,12 @@ void LCD_ShowString_DMA(uint16_t x, uint16_t y, uint16_t w, const char *str)
 
 ### 9.1 验证步骤
 
-1. 编译下载，屏幕先黑一下（背光关 → 清屏 → 开背光），随后显示五行标题与数值；
+1. 编译下载：屏幕先黑一下（背光关 → 寄存器配置 → 清屏），随后点亮，顶部一行标题、其下五行数值；
 2. **用手遮住 BH1750**，Lux 行数值应明显下降；手电照射升至上千 lx；
 3. **对着 HTU21D 哈气**，湿度行明显上升；
 4. **翻转/侧立开发板**，Acc 行的 X/Y/Z 数值随之变化，静止平放时某轴约 ±1000；
-5. Time 行每秒递增（PCF8563 装了纽扣电池时断电后仍走时）。
+5. Time 行每秒递增（PCF8563 装了纽扣电池时断电后仍走时）；没装电池则显示 `TIME LOST (no battery)`；
+6. **拔掉某个模块再上电**：BH1750/HTU21D 行会显示负值，Acc 行显示 `LIS3DH NOT FOUND`——这验证了"自检信息画到屏上"的设计。
 
 ### 9.2 常见问题速查
 
@@ -747,9 +1091,13 @@ void LCD_ShowString_DMA(uint16_t x, uint16_t y, uint16_t w, const char *str)
 | 完全白屏、无任何显示 | FSMC 未配通（NE1/A17 引脚复用错、未使能写） | 检查 CubeMX 中 FSMC 的 NE1、Register Select=A17、Write Operation=Enabled；检查 DATAST 是否过小 |
 | 花屏、颜色错乱、随机色块 | DATAST/ADDSET 太小，数据未稳定即锁存 | DATAST 从 4 逐步加大到 8~15；确认 HCLK 确实是 168MHz |
 | 显示内容全是"命令"效果（如全屏一种异常色） | 命令/数据地址搞反（A17 偏移算错） | 数据地址必须是基地址 \| (1<<18)，不是 \| (1<<17) |
+| DMA 灌屏后整行只有一种颜色 / 花屏 | **M2M 模式下自增位配反**：源（PeriphInc）应自增、目的（MemInc）应固定 | 改为 `PeriphInc = ENABLE`、`MemInc = DISABLE`，并核对 `HAL_DMA_Start_IT(源, 目的, 个数)` 的实参顺序 |
+| DMA 刷了一次之后屏幕再也不动 | 出错回调没清零 `dma_busy`（或被 `dma_busy` 挡住后一直返回 HAL_BUSY） | 在 `XferErrorCallback` 里同样清零；确认回调是挂在句柄上而不是"重定义库函数" |
+| 编译报 multiple definition: `DMA2_Stream0_IRQHandler` | CubeMX 的 MemToMem 已生成一份中断转发，又手写了一份 | 删掉其中一份；走 CubeMX 生成时把回调挂到 CubeMX 的句柄上即可 |
+| 想同时用 ADC 采集时 DMA 冲突 | 《ADC 采集配置》笔记里 ADC1 也用 DMA2 Stream0 | 给其中一个换 Stream（如 LCD 用 Stream1），或复用同一流分时启动 |
 | 背光不亮但实测 FSMC 读写正常 | PD2 未配成输出或电平反了 | 查 MX_GPIO_Init 中 PD2；用万用表量 PD2 电平 |
-| 传感器数据全是 -1 或 0 | 软件 I2C 总线不通（上拉电阻、PA0/PA1 接线） | 按《IIC 通信》笔记 8.3.3 节的方法排查总线 |
-| 屏幕显示但数值不刷新 | while 循环卡在 DMA busy 或 I2C 死等 | 检查 `dma_busy` 是否在回调中清零；I2C_WaitAck 加超时 |
+| 传感器数据全是 -1 / 显示 NOT FOUND | 软件 I2C 总线不通（上拉电阻、PA0/PA1 接线），或 LIS3DH 的 WHO_AM_I 没读到 0x33 | 按《IIC 通信》笔记 8.3.3 节的方法排查总线 |
+| 数值行有旧数字残留 | 刷新时没有先铺背景色 | 用本笔记的 `LCD_RefreshRow`（先 `LCD_Fill` 再写字符串），或把数值格式改成定宽 |
 | 改了 CubeMX 重新生成后 LCD 初始化代码丢失 | 代码写在了 CubeMX 管理区 | 自己的驱动放 bsp_lcd.c 等独立文件，或写在 USER CODE 区 |
 
 ---
@@ -758,6 +1106,8 @@ void LCD_ShowString_DMA(uint16_t x, uint16_t y, uint16_t w, const char *str)
 
 1. **FSMC 驱动 LCD 的本质是"地址映射"**：配置好 NE1 + A17 + 16 位 + 模式 B 之后，LCD 命令口就是 `0x60000000`、数据口就是 `0x60040000`，用指针赋值即可完成 8080 写时序，软件层面看不到任何 GPIO 操作；
 2. **RS 用地址线模拟**：A17=1 为数据、A17=0 为命令；16 位总线下 HADDR 右移一位，偏移位是 (17+1)=18 而不是 17——这是最容易算错的地方；
-3. **时序余量要留够**：NT35510 写周期最短 66ns，ADDSET=4/DATAST=8 在 168MHz 下读 71ns、写约 83ns，稳妥可靠；花屏先查时序；
-4. **显示链路分层**：软件 I2C（PA1/PA0）采集四个传感器 → 结构体缓存 → sprintf 格式化 → 字符渲染 → FSMC 写 GRAM，两 subsystem 互不干扰；
-5. **CPU 占用优化两条路**：软件 I2C 的 200ms 是物理开销（要降只能改硬件 I2C 或拉长周期）；LCD 刷屏用 **DMA2 内存到内存** 把渲染好的帧缓冲灌进 GRAM，搬运期间 CPU 可与 I2C 采集并行，是最划算的优化。
+3. **时序余量要留够**：NT35510 写周期最短 66ns，ADDSET=4/DATAST=8 在 168MHz 下一次 16 位写约 83ns，稳妥可靠；花屏先加 DATAST；
+4. **开窗要少、每次多写**：一次开窗（0x2A/0x2B）要花 12 次总线写，所以填充用 `LCD_Fill`、字符按"整字符开一次窗口"来写；`LCD_DrawPoint` 一点一开窗，成本是批量写的 13 倍，只适合零星画点；
+5. **显示链路分层**：软件 I2C（PA1/PA0）采集四个传感器 → 数据缓存 → sprintf 格式化 → 字符渲染 → FSMC 写 GRAM，两套子系统引脚不冲突、逻辑解耦，任一侧出问题都能单独定位；
+6. **DMA 的正确姿势**：FSMC 不产生 DMA 请求，只能用 **DMA2 内存到内存**把帧缓冲灌进 GRAM；M2M 下"**源 = Peripheral（受 PeriphInc 控制）、目的 = Memory（受 MemInc 控制）**"，故 `PeriphInc = ENABLE`、`MemInc = DISABLE`，且 Mode 必须 Normal；回调要挂在句柄上且完成/出错都要解锁；
+7. **关于 DMA 收益要诚实**：本工程刷屏只占 CPU 约 0.4%，DMA 不缩短墙钟时间（FSMC 的 83ns 写周期是硬上限），它的价值在"把搬运藏进 I2C 的 66ms 等待窗口"以及为将来大帧刷新做准备——**判断标准是"刷屏期间 CPU 有没有别的事可做"**。
