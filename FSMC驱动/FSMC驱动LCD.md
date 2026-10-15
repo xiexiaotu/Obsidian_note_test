@@ -630,12 +630,16 @@ void LCD_ShowString(uint16_t x, uint16_t y, uint16_t maxW,
 
 **表 7-1 从 IIC 笔记复用的器件层接口**
 
-| 器件 | 初始化 | 读取 | 返回值的坑 |
-| --- | --- | --- | --- |
-| BH1750 光照 | `BH1750_Init()` | `float BH1750_ReadLux()` | 读取失败返回 **-1.0** |
-| HTU21D 温湿度 | `HTU21D_Init()` | `float HTU21D_ReadTemp()` / `HTU21D_ReadHumidity()` | 同上 |
-| PCF8563 时钟 | —（无需初始化） | `void PCF8563_ReadTime(PCF8563_Time_t *)` | 需配合 `PCF8563_IsTimeValid()` 判断掉电 |
-| LIS3DH 三轴 | `uint8_t LIS3DH_Init()` | `void LIS3DH_ReadAcc(short *acc)` | 初始化返回 0 表示 WHO_AM_I 不匹配（没接好） |
+| 器件 | 头文件 | 初始化 | 读取 | 返回值的坑 |
+| --- | --- | --- | --- | --- |
+| BH1750 光照 | `bsp_bh1750.h` | `void BH1750_Init(void)` | `float BH1750_ReadLux(void)` | 读取失败返回 **-1.0** |
+| HTU21D 温湿度 | `bsp_htu21d.h` | `void HTU21D_Init(void)` | `float HTU21D_ReadTemp(void)` / `HTU21D_ReadHumidity(void)` | 同上 |
+| PCF8563 时钟 | `bsp_pcf8563.h` | —（无需初始化） | `void PCF8563_ReadTime(PCF8563_Time_t *)` | 时间是否可信要调 `uint8_t PCF8563_IsTimeValid(void)`：**返回 1 = 可信，0 = 曾掉电**；返回 0 时用 `void PCF8563_WriteTime(const PCF8563_Time_t *)` 重新设定 |
+| LIS3DH 三轴 | `bsp_lis3dh.h` | `uint8_t LIS3DH_Init(void)` | `void LIS3DH_ReadAcc(short *acc)` | Init 读到 WHO_AM_I = **0x33** 才返回 **1**，返回 **0** 表示器件不在线 |
+
+> **这些函数定义在哪？——不在本笔记里，也不用重写。** 上表四个器件层属于《IIC 通信》笔记第 9 章（该笔记代码清单 9-2 ~ 9-5），源码分别在 `bsp_bh1750.c`、`bsp_htu21d.c`、`bsp_pcf8563.c`、`bsp_lis3dh.c` 及其同名头文件中，`LIS3DH_Init()`、`PCF8563_IsTimeValid()`、`LIS3DH_ReadAcc()` 都已在那边**声明并完整实现**。
+>
+> 所以本笔记第 7 章的 main.c 只做两件事：`#include` 这四个头文件，然后调用——**应用层不重复声明也不重复实现驱动层**。看到 `LIS3DH_Init()`、`PCF8563_IsTimeValid()` 不必去本笔记里找定义，直接看《IIC 通信》笔记即可。移植时把 6 个驱动文件（`bsp_soft_i2c`、`bsp_sensor_io`、`bsp_bh1750`、`bsp_htu21d`、`bsp_pcf8563`、`bsp_lis3dh`）与本笔记的 `bsp_lcd`、`lcd_dma` 一起加入工程就能编译。
 
 核心约定：主循环每 1 秒采集一轮传感器数据，`sprintf` 格式化后**整行重写**（先铺背景色、再画字符）到 LCD 的固定行。整行重写比"精确擦除差异位"简单得多，且天然不会残留旧字符。
 
@@ -694,7 +698,7 @@ int main(void)
   short acc[3] = {0, 0, 0};
   PCF8563_Time_t now;
   char buf[48];
-  uint8_t lisOk, timeOk;
+  uint8_t lisOk, rtcLost;
 
   HAL_Init();
   SystemClock_Config();        /* 168MHz，HCLK=168MHz 供 FSMC */
@@ -708,10 +712,24 @@ int main(void)
   /* ---------- 传感器初始化（复用 IIC 笔记 9.2.3 节的器件层） ---------- */
   BH1750_Init();
   HTU21D_Init();
-  lisOk  = LIS3DH_Init();              /* 1 = 读到 WHO_AM_I = 0x33，器件在线 */
-  timeOk = PCF8563_IsTimeValid();      /* 1 = 时间可信，0 = 曾掉电 */
+  lisOk   = LIS3DH_Init();              /* 1 = 读到 WHO_AM_I = 0x33，器件在线 */
+  rtcLost = (PCF8563_IsTimeValid() == 0) ? 1 : 0;   /* 1 = 曾掉电（模块没装纽扣电池）*/
+
+  /* 掉电过就补一个初始时间（做法同 IIC 笔记代码清单 9-6），让屏上时钟立即可用；
+     若只想看到告警、不想自动改时间，把这段删掉即可 */
+  if (rtcLost)
+  {
+    PCF8563_Time_t init = { 0, 30, 12, 7, 3, 10, 26 };  /* 秒,分,时,日,星期,月,年 */
+    PCF8563_WriteTime(&init);
+  }
 
   LCD_DrawTitle();
+
+  /* RTC 掉电时在标题右侧提示一次（标题行不会被数据刷新覆盖，所以只画一次） */
+  if (rtcLost)
+  {
+    LCD_ShowString(ROW_X + 248, TITLE_Y, 96, LCD_FG_COLOR, LCD_BG_COLOR, "[RTC RESET]");
+  }
 
   while (1)
   {
@@ -723,15 +741,8 @@ int main(void)
     LIS3DH_ReadAcc(acc);
 
     /* 2. 逐行刷新：sprintf 格式化 → 清背景 → 写字符串 */
-    if (timeOk)
-    {
-      sprintf(buf, "Time : 20%02d-%02d-%02d %02d:%02d:%02d",
-              now.year, now.month, now.day, now.hour, now.min, now.sec);
-    }
-    else
-    {
-      sprintf(buf, "Time : TIME LOST (no battery)");
-    }
+    sprintf(buf, "Time : 20%02d-%02d-%02d %02d:%02d:%02d",
+            now.year, now.month, now.day, now.hour, now.min, now.sec);
     LCD_RefreshRow(ROW_TIME, buf);
 
     /* 读取失败时驱动返回负值，屏幕上会出现明显的负数——这是最好的自检 */
@@ -763,7 +774,7 @@ int main(void)
 
 - 数据链路是"**器件驱动 → float/结构体 → sprintf → LCD_ShowString → FSMC 写 GRAM**"，I2C 与 LCD 完全解耦，任何一边出问题都能单独定位；
 - 每次刷新一行 = 铺背景（320×16 = 5120 像素）+ 写字符（33 字符 × 128 像素 ≈ 4224 像素），共约 9300 次 FSMC 写 ≈ **0.8ms**；5 行合计约 4ms/秒，CPU 占用约 0.4%——**这也是"要不要为刷屏上 DMA"的判断依据：本工程 DMA 省下的 CPU 时间只有几毫秒/秒，收益有限，真正的价值在"把这 4ms 藏进 I2C 的等待里"以及将来做波形/图片显示时的可扩展性**（见第 8 章）；
-- **注意"每行都铺背景"与"写入量"的权衡**：铺背景会把整行的空白像素也写一遍（5120 像素里真正有字的只有约 4224 个），换来的是"绝不留残影"。若刷屏区域更大、刷新更频繁，就该改用"标签画一次 + 数值定宽刷新"的方案（要点 2）；
+- **注意"每行都铺背景"与"写入量"的权衡**：`LCD_ShowChar()` 本身就会写满每个字符格子（包括笔画之间的背景像素），所以 `LCD_Fill()` 其实是"防残留"的双保险——它的作用是盖住**字符串尾部之外**的区域（例如 Acc 行从 `LIS3DH NOT FOUND` 变成正常数值后，尾巴会短一截）。如果每行的字符串宽度恒定（`%7.1f`、`%6d` 这类定宽格式），就可以省掉 `LCD_Fill()`，写入量直接减半；反过来，一旦有"某行整体变短"的情况（如上面这种状态切换），就必须保留清背景；
 - 若个别传感器未接，屏幕上会显示负数或 `NOT FOUND`，一眼能看出来——这比"黑屏"友好得多。
 
 ---
@@ -1081,7 +1092,7 @@ while (1)
 2. **用手遮住 BH1750**，Lux 行数值应明显下降；手电照射升至上千 lx；
 3. **对着 HTU21D 哈气**，湿度行明显上升；
 4. **翻转/侧立开发板**，Acc 行的 X/Y/Z 数值随之变化，静止平放时某轴约 ±1000；
-5. Time 行每秒递增（PCF8563 装了纽扣电池时断电后仍走时）；没装电池则显示 `TIME LOST (no battery)`；
+5. Time 行每秒递增（PCF8563 装了纽扣电池时断电后仍走时）；若模块没装电池，上电时标题行右侧会出现 `[RTC RESET]`，说明程序检测到掉电并写入了一个初始时间（代码清单 7-1 里给的是 2026-10-07 12:30:00），随后时间从该点继续走；
 6. **拔掉某个模块再上电**：BH1750/HTU21D 行会显示负值，Acc 行显示 `LIS3DH NOT FOUND`——这验证了"自检信息画到屏上"的设计。
 
 ### 9.2 常见问题速查
