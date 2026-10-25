@@ -263,6 +263,9 @@ HCLK = 168MHz，1 个 HCLK 周期 = 1000/168 ≈ 5.95 ns。模式 B 下读写周
 
 1. 左侧 **Connectivity → FSMC**，勾选 **Memory type = LCD Interface**；
 2. **Chip Select** 选 **NE1**（对应 PD7）；**LCD Register Select** 选 **A17**（对应 PD12）——CubeMX 会自动把 PD14/PD15/PD0/PD1/PE7~PE15/PD8~PD10 配成数据线、PD4=NOE、PD5=NWE、PD7=NE1、PD12=A17，全部 AF12；
+![](Pasted%20image%2020261025152138.png)
+
+
 3. **Parameter Settings** 按下表填写：
 
 **表 5-1 FSMC Parameter Settings（LCD Interface，NE1 + A17）**
@@ -278,6 +281,7 @@ HCLK = 168MHz，1 个 HCLK 周期 = 1000/168 ≈ 5.95 ns。模式 B 下读写周
 | Extended mode                             | Disable       | 读写共用一套时序              |
 | Wait                                      | Disable       | ILI9341 不接 NWAIT     |
 | Write operation                           | Enabled       | 必须使能写，否则只能读           |
+![](Pasted%20image%2020261025152325.png)
 
 4. **NVIC / DMA**：FSMC 本身不产生中断与 DMA 请求，这里**不用勾选**（LCD 的 DMA 在第 8 章用 DMA2 内存到内存方式单独配置）。
 
