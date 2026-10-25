@@ -1717,14 +1717,70 @@ FSMC 本身**不产生 DMA 请求**（它是存储器接口，不是外设请求
 
 ### 8.3 CubeMX 配置 DMA2
 
-1. **System Core → DMA** → **MemToMem** → 点击 **Add**，CubeMX 生成 `hdma_memtomem_dma2_stream0`，勾选 **DMA2 Stream0 global interrupt**；
-2. **parameter 里注意两件事**：① Mode 必须 **Normal**（M2M 不支持 Circular）；② **源、目的的自增设置**——CubeMX 的 MemToMem 面板在部分版本里只给一个"Increment Address"选项（两端同设置），**如果它不让你分别设置两端，就直接手写初始化代码**（代码清单 8-1），别硬凑；
-3. 若走 CubeMX 生成：注意 `stm32f4xx_it.c` 里会由 CubeMX 自动加上 `DMA2_Stream0_IRQHandler()`，它会调用 CubeMX 自己的 `hdma_memtomem_dma2_stream0` 句柄——**此时不要再重复定义一次该中断函数**（否则链接报 multiple definition），而是复用 CubeMX 的句柄（在 `MX_DMA_Init()` 之外，把它的 `XferCpltCallback` 换成自己的回调即可）；
-4. 本章 8.4 节给出的代码是**完全手写、不依赖 CubeMX 生成 DMA** 的版本，工程上最省心：只要在 DMA 配置里勾了 NVIC，或者干脆自己在 `LCD_DMA_Init()` 里配 NVIC 都行。
+本节按"**DMA 也交给 CubeMX 生成、代码只补它给不了的那几项**"来配，与本笔记其余章节"配置全部在 CubeMX 里做"的思路一致。如果你不想让 CubeMX 插手 DMA，直接跳到 8.4.5 的完全手写版，两种方式对外接口完全相同。
+
+1. **System Core → DMA → MemToMem 标签页 → Add Request**：CubeMX 会生成一个名为 `hdma_memtomem_dma2_stream0` 的请求（Stream 号取决于你选的那一路，默认 Stream0）；
+2. **同一行右侧勾上 "DMA2 Stream0 global interrupt"**：这一勾不是可选项——它会连带生成 NVIC 使能、优先级和 `stm32f4xx_it.c` 里的中断入口，是整套异步方案能跑起来的前提。**没勾的后果很典型：第一次刷屏能出图，之后屏幕再也不动**（搬运完成中断进不来，忙标志永远为 1）；
+3. **Parameter Settings 按表 8-2 填**，其中标了"面板给不了"的两项不用纠结，8.4.3 的代码会纠正。
+
+**表 8-2 CubeMX MemToMem 面板参数（以本工程要的值为准）**
+
+| 面板项 | 本工程要的值 | 面板能不能设 | 说明 |
+| --- | --- | --- | --- |
+| Direction | Memory To Memory | 固定（M2M 请求默认如此） | 与 8.2 节的 PAR/M0AR 映射直接相关 |
+| Mode | **Normal** | 能（M2M 下 Circular 应被禁用） | M2M 严禁 Circular，只能用 Normal |
+| Increment Address | 源 = √、目的 = × | **多数版本只给一个勾选框，两端同设置** | 面板给不了 → 见 8.4.3 的纠正 |
+| Data Width | **Half Word** | 能，但**默认常常是 Word** | 用 Word 会一次搬 4 字节，落到 16 位 FSMC 上直接错位花屏 |
+| FIFO Mode | Disable | 能 | 关闭 FIFO 时突发必须为 Single |
+| Priority | High / Medium | 能 | 只影响与其它 DMA 争总线的先后，不影响正确性 |
+
+4. **不要手改 `dma.c`**。`dma.c` 是 CubeMX 的"领地"，下次点 **GENERATE CODE** 会整段覆盖——这也是"昨天调好的花屏今天又回来了"这类悬案的常见原因。凡是要改的参数，一律写进 8.4.3 的 `LCD_DMA_Init()`（你自己的文件，CubeMX 不碰），在 `MX_DMA_Init()` 之后再覆盖一次并重新 `HAL_DMA_Init()`；
+5. **生成结果在这三处**（版本不同位置略有差异，按名字找即可）：
+
+**表 8-3 CubeMX 生成的三个位置**
+
+| 文件 | CubeMX 生成的内容 | 你要做的事 |
+| --- | --- | --- |
+| `Core/Src/dma.c` | `DMA_HandleTypeDef hdma_memtomem_dma2_stream0;` + `MX_DMA_Init()`（开 DMA2 时钟、配 NVIC、`HAL_DMA_Init()`） | **一个字都不要改** |
+| `Core/Inc/dma.h` | 上面那个句柄的 `extern` 声明、`MX_DMA_Init()` 原型 | 在 `lcd_dma.c` 里 `#include` 它 |
+| `Core/Src/stm32f4xx_it.c` | `DMA2_Stream0_IRQHandler()` → `HAL_DMA_IRQHandler(&hdma_memtomem_dma2_stream0)` | **绝不能在自己的文件里再写一遍**（否则链接报 multiple definition） |
+
+6. **冲突检查**：DMA2 Stream0 也是 ADC1 的默认流（见《ADC 采集配置》笔记），两篇笔记的工程合并时 CubeMX 会提示资源冲突。解决方法是把 LCD 换到 **DMA2 Stream1**，句柄名随之变成 `hdma_memtomem_dma2_stream1`——代码里只需要改 8.4.3 顶部那一行宏别名，其余不动。
 
 ### 8.4 代码分析
 
-列表 7: 代码清单 8-1 DMA 刷屏驱动（lcd_dma.h / lcd_dma.c）
+本节给两个版本，**对外接口完全一致**，8.4.4 的上层代码两版共用、一字不改：
+
+- **8.4.2 + 8.4.3 CubeMX 生成版（推荐）**：CubeMX 负责时钟、NVIC、句柄、中断入口，我们只补齐它给不了的三项；
+- **8.4.5 完全手写版**：自己建句柄、自己开时钟、自己写 `DMA2_Stream0_IRQHandler()`。适合无 CubeMX 的工程，或要把这段代码搬进寄存器版/标准库版工程。
+
+#### 8.4.1 两版的分工
+
+**表 8-4 两种写法的差异**
+
+| 关注点 | CubeMX 生成版（8.4.3） | 完全手写版（8.4.5） |
+| --- | --- | --- |
+| 句柄 | 复用 `dma.c` 里的 `hdma_memtomem_dma2_stream0` | 文件内 `static DMA_HandleTypeDef hdma_lcd;` |
+| DMA2 时钟 | `MX_DMA_Init()` 已开 | 自己 `__HAL_RCC_DMA2_CLK_ENABLE()` |
+| NVIC | 勾选中断后自动生成 | 自己 `HAL_NVIC_SetPriority()` / `EnableIRQ()` |
+| 中断入口 | `stm32f4xx_it.c` 自动生成，**不能重复定义** | 自己写 `DMA2_Stream0_IRQHandler()` |
+| 参数纠正 | 覆盖面板给不了的两项后重新 `HAL_DMA_Init()` | 直接按需求填 `Init` 结构体 |
+| 换 Stream | 改 CubeMX 配置 + 改 1 行宏别名 | 改 `Instance`、`IRQn`、句柄名（3 处） |
+| 受 GENERATE CODE 影响 | 不受影响（不碰 `dma.c`） | 不受影响（本来就无关） |
+| 适用场景 | 工程由 CubeMX 生成（本笔记主线） | 无 CubeMX 的工程 |
+
+文件划分：
+
+```
+lcd_dma.h       ← 两版通用：接口声明 + 帧缓冲尺寸（8.4.2）
+lcd_dma.c       ← 二选一：CubeMX 版（8.4.3）或手写版（8.4.5）
+应用层/main.c   ← 两版通用：渲染 + 显示一行（8.4.4）
+dma.c / dma.h   ← 仅 CubeMX 版需要，自动生成，不要手改
+```
+
+#### 8.4.2 公共头文件
+
+列表 7: 代码清单 8-1 DMA 刷屏接口（lcd_dma.h，两版通用）
 
 ```c
 /* lcd_dma.h */
@@ -1738,6 +1794,7 @@ FSMC 本身**不产生 DMA 请求**（它是存储器接口，不是外设请求
 #define LINE_BUF_W   320
 #define LINE_BUF_H   16
 
+/* 两版实现不同，对外只有这三个函数 */
 void LCD_DMA_Init(void);
 HAL_StatusTypeDef LCD_DMA_FillBuffer(uint16_t x, uint16_t y,
                                      uint16_t w, uint16_t h,
@@ -1747,77 +1804,78 @@ void LCD_ShowString_DMA(uint16_t x, uint16_t y, uint16_t maxW, const char *str);
 #endif
 ```
 
+#### 8.4.3 CubeMX 生成版
+
+这一版的关键只有一句话：**不新建句柄、不开时钟、不写中断入口，只在 CubeMX 的句柄上"改三项参数 + 挂两个回调"**。
+
+列表 8: 代码清单 8-2 DMA 刷屏驱动 · CubeMX 生成版（lcd_dma.c）
+
 ```c
-/* lcd_dma.c */
+/* lcd_dma.c —— 方案 A：DMA 由 CubeMX 生成（推荐） */
 #include "lcd_dma.h"
+#include "dma.h"      /* CubeMX 生成：extern hdma_memtomem_dma2_stream0; MX_DMA_Init(); */
+#include "main.h"     /* Error_Handler() */
 
-static DMA_HandleTypeDef hdma_lcd;
-static volatile uint8_t  dma_busy = 0;      /* 1 = 上一次搬运还没结束 */
+/* 句柄别名：换 Stream（例如与 ADC1 冲突改用 Stream1）时只改这一行 */
+#define HDMA_LCD   hdma_memtomem_dma2_stream0
 
-static void LCD_DMA_CpltCallback(DMA_HandleTypeDef *hdma);
-static void LCD_DMA_ErrorCallback(DMA_HandleTypeDef *hdma);
+static volatile uint8_t dma_busy = 0;      /* 1 = 上一次搬运还没结束 */
+
+static void LCD_DMA_CpltCallback(DMA_HandleTypeDef *hdma)
+{
+  (void)hdma;
+  dma_busy = 0;
+}
+
+/* 搬运出错也必须解锁，否则一次错误就把接口永久锁死，屏幕从此不再刷新 */
+static void LCD_DMA_ErrorCallback(DMA_HandleTypeDef *hdma)
+{
+  (void)hdma;
+  dma_busy = 0;
+}
 
 /**
-  * @brief  初始化 DMA2 Stream0：帧缓冲 → FSMC 数据端口（内存到内存）
-  * @note   关键三点：
-  *         ① M2M 模式下"源 = Peripheral 端（PAR）、目的 = Memory 端（M0AR）"，
-  *            所以 PeriphInc 控源、MemInc 控目的。本应用源要自增、目的固定，
-  *            因此 PeriphInc = ENABLE、MemInc = DISABLE（与直觉相反，详见 8.2 节）
-  *         ② Mode 必须是 Normal，M2M 禁止 Circular
-  *         ③ FIFO 关闭 + 单次突发：M2M 用 FIFO/突发虽能提速，但要求地址按突发
-  *            宽度对齐，且 FIFO 门槛设置不当时易出现"传一半停住"。FSMC 本就是
-  *            慢速从设备，省这点时间没有意义，稳定性优先
+  * @brief  在 CubeMX 已初始化过的句柄上纠正三项参数，然后重新初始化并挂回调
+  * @note   ① 面板给不了"源自增 + 目的固定"，且 Data Width 常默认成 Word，
+  *            所以这里必须覆盖成 PINC=ENABLE / MINC=DISABLE / 两端 HALFWORD。
+  *            用 Word 时一次搬 4 字节，16 位 FSMC 上会错位花屏
+  *         ② 改在本文件而不是 dma.c：CubeMX 重新生成代码不会覆盖这里
+  *         ③ 不再配 DMA2 时钟和 NVIC，MX_DMA_Init() 已经做了；
+  *            也不再定义 DMA2_Stream0_IRQHandler，stm32f4xx_it.c 里已有
   */
 void LCD_DMA_Init(void)
 {
-  __HAL_RCC_DMA2_CLK_ENABLE();
+  HDMA_LCD.Init.PeriphInc           = DMA_PINC_ENABLE;          /* 源：帧缓冲逐个像素自增 */
+  HDMA_LCD.Init.MemInc              = DMA_MINC_DISABLE;         /* 目的：LCD 数据口固定不动 */
+  HDMA_LCD.Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD;  /* 16 位 = 1 个像素 */
+  HDMA_LCD.Init.MemDataAlignment    = DMA_MDATAALIGN_HALFWORD;
+  HDMA_LCD.Init.Mode                = DMA_NORMAL;               /* M2M 禁止 Circular */
+  HDMA_LCD.Init.FIFOMode            = DMA_FIFOMODE_DISABLE;
+  HDMA_LCD.Init.MemBurst            = DMA_MBURST_SINGLE;
+  HDMA_LCD.Init.PeriphBurst         = DMA_PBURST_SINGLE;
 
-  hdma_lcd.Instance                 = DMA2_Stream0;
-  hdma_lcd.Init.Channel             = DMA_CHANNEL_0;          /* M2M 模式下通道号无效 */
-  hdma_lcd.Init.Direction           = DMA_MEMORY_TO_MEMORY;
-  hdma_lcd.Init.PeriphInc           = DMA_PINC_ENABLE;        /* 【源】帧缓冲逐个像素自增 */
-  hdma_lcd.Init.MemInc              = DMA_MINC_DISABLE;       /* 【目的】LCD 数据口固定不动 */
-  hdma_lcd.Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD;/* 源：16 位（RGB565 一像素） */
-  hdma_lcd.Init.MemDataAlignment    = DMA_MDATAALIGN_HALFWORD;/* 目的：16 位 */
-  hdma_lcd.Init.Mode                = DMA_NORMAL;
-  hdma_lcd.Init.Priority            = DMA_PRIORITY_HIGH;
-  hdma_lcd.Init.FIFOMode            = DMA_FIFOMODE_DISABLE;
-  hdma_lcd.Init.FIFOThreshold       = DMA_FIFO_THRESHOLD_FULL;
-  hdma_lcd.Init.MemBurst            = DMA_MBURST_SINGLE;
-  hdma_lcd.Init.PeriphBurst         = DMA_PBURST_SINGLE;
-
-  if (HAL_DMA_Init(&hdma_lcd) != HAL_OK)
+  if (HAL_DMA_Init(&HDMA_LCD) != HAL_OK)
   {
     Error_Handler();
   }
 
-  /* 回调必须在 HAL_DMA_Init() 之后挂：F4 的 HAL_DMA_Init 会把句柄里的
-     所有回调指针清空，先挂就等于白挂。若用 HAL_DMA_RegisterCallback()
-     注册，同样要放在 Init 之后 */
-  hdma_lcd.XferCpltCallback  = LCD_DMA_CpltCallback;
-  hdma_lcd.XferErrorCallback = LCD_DMA_ErrorCallback;
-
-  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 1, 0);
-  HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
-}
-
-/* 搬运完成：解锁 */
-static void LCD_DMA_CpltCallback(DMA_HandleTypeDef *hdma)
-{
-  if (hdma == &hdma_lcd) dma_busy = 0;
-}
-
-/* 搬运出错：也必须解锁，否则一次错误就把接口永久锁死，屏幕从此不再刷新 */
-static void LCD_DMA_ErrorCallback(DMA_HandleTypeDef *hdma)
-{
-  if (hdma == &hdma_lcd) dma_busy = 0;
+  /* 用 HAL 的注册接口挂回调（F4 HAL 提供 HAL_DMA_RegisterCallback）。
+     该接口要求句柄处于 READY 状态，所以只能放在 HAL_DMA_Init() 之后；
+     搬运过程中调用会直接返回 HAL_ERROR */
+  if ((HAL_DMA_RegisterCallback(&HDMA_LCD, HAL_DMA_XFER_CPLT_CB_ID,
+                                LCD_DMA_CpltCallback)  != HAL_OK) ||
+      (HAL_DMA_RegisterCallback(&HDMA_LCD, HAL_DMA_XFER_ERROR_CB_ID,
+                                LCD_DMA_ErrorCallback) != HAL_OK))
+  {
+    Error_Handler();
+  }
 }
 
 /**
   * @brief  用 DMA 把一个矩形区域的像素写入 LCD
   * @param  pixels: 内部 SRAM 中的像素数组（RGB565，w*h 个 uint16_t）
   * @retval HAL_BUSY = 上一次搬运尚未完成；其余为 HAL 返回值
-  * @note   注意执行顺序：必须在启动 DMA **之前**开窗并发出 0x2C，
+  * @note   顺序不能反：必须在启动 DMA **之前**开窗并发出 0x2C，
   *         否则 DMA 灌进去的像素不会被当作 GRAM 数据
   */
 HAL_StatusTypeDef LCD_DMA_FillBuffer(uint16_t x, uint16_t y,
@@ -1828,9 +1886,9 @@ HAL_StatusTypeDef LCD_DMA_FillBuffer(uint16_t x, uint16_t y,
 
   if (dma_busy) return HAL_BUSY;
   if (w == 0 || h == 0) return HAL_ERROR;
-  /* 这里必须自己挡越界：LCD_OpenWindow() 会把窗口裁到屏幕内，
-     而 DMA 的传输个数用的是原始的 w*h——两者不一致时，多出来的像素
-     会写到窗口之外，表现为屏幕右侧/下方出现一条错位色带 */
+  /* 必须自己挡越界：LCD_OpenWindow() 会把窗口裁到屏幕内，而 DMA 的传输
+     个数用的是原始 w*h，两者不一致时多出的像素会写到窗口之外，
+     表现为屏幕右侧/下方出现一条错位色带 */
   if ((uint32_t)x + w > LCD_WIDTH || (uint32_t)y + h > LCD_HEIGHT) return HAL_ERROR;
 
   dma_busy = 1;
@@ -1838,23 +1896,28 @@ HAL_StatusTypeDef LCD_DMA_FillBuffer(uint16_t x, uint16_t y,
   LCD_OpenWindow(x, y, w, h);
   LCD_WRITE_CMD(0x2C);          /* 进入 Memory Write，DMA 只负责灌数据 */
 
-  st = HAL_DMA_Start_IT(&hdma_lcd, (uint32_t)pixels,
+  st = HAL_DMA_Start_IT(&HDMA_LCD, (uint32_t)pixels,
                         LCD_DATA_ADDR, (uint32_t)w * h);
   if (st != HAL_OK)
   {
-    dma_busy = 0;               /* 启动失败要立即解锁，否则接口再也调不动 */
+    dma_busy = 0;               /* 启动失败（句柄非 READY）要立即解锁 */
   }
   return st;
 }
-
-/* 中断入口：写在 stm32f4xx_it.c 或本文件（全局只能有一份） */
-void DMA2_Stream0_IRQHandler(void)
-{
-  HAL_DMA_IRQHandler(&hdma_lcd);
-}
 ```
 
-列表 8: 代码清单 8-2 用 DMA 显示一行文字（先在 RAM 里渲染，再整块灌屏）
+**这一版没有的东西，恰恰是要点**：
+
+- 没有 `__HAL_RCC_DMA2_CLK_ENABLE()`——在 `MX_DMA_Init()` 里；
+- 没有 `HAL_NVIC_SetPriority/EnableIRQ`——勾了中断后 CubeMX 生成；
+- 没有 `DMA2_Stream0_IRQHandler()`——`stm32f4xx_it.c` 里已有，重复定义会链接失败；
+- 没有 `hdma_lcd` 这个变量——直接操作 CubeMX 的句柄。**正因为如此，CubeMX 重新生成代码后这段逻辑依然成立**，这是它比"手改 dma.c"更值得推荐的根本原因。
+
+#### 8.4.4 两版共用：渲染与显示
+
+渲染部分只在内部 SRAM 里拼像素，和 DMA 用哪个句柄完全无关，所以两版共用同一份代码。
+
+列表 9: 代码清单 8-3 用 DMA 显示一行文字（先在 RAM 里渲染，再整块灌屏）
 
 ```c
 #include "lcd_dma.h"
@@ -1927,13 +1990,94 @@ void LCD_ShowString_DMA(uint16_t x, uint16_t y, uint16_t maxW, const char *str)
 }
 ```
 
-**要点分析**：
+#### 8.4.5 完全手写版
 
-1. **`HAL_DMA_Start_IT()` 的源/目的顺序按 M2M 的映射关系写**：第一个参数（源）进 PAR、第二个参数（目的）进 M0AR，自增位与之配对，配反了就花屏（见 8.2 节）；
-2. **回调不是"重定义库函数"**：F4 HAL 里没有可以覆盖的 `HAL_DMA_XferCpltCallback()`，正确做法是把函数指针挂到句柄上（`hdma->XferCpltCallback = …`）或用 `HAL_DMA_RegisterCallback()`，并且**必须在 `HAL_DMA_Init()` 之后挂**；
-3. **完成与出错都要解锁**：只解完成回调、不解出错回调，一次 DMA 错误就会让 `dma_busy` 永久为 1，屏幕"刷新一次之后就再也不动"——这是排查时最容易误判成"屏幕坏了"的软件故障；
-4. **`0x2C` 必须在启动 DMA 之前发**：DMA 只往数据口灌字节，不负责发命令。若顺序反了，屏幕会显示上一次开窗区域的残留内容；
-5. **渲染阶段是纯 RAM 操作**：`LCD_RenderString()` 只写内部 SRAM，不产生任何 FSMC 周期，所以即使没有 DMA，这套"先渲染到缓冲、再一次性写屏"的结构也比"逐点 `LCD_DrawPoint`"快得多（少了 13 倍的开窗开销）。
+不想让 CubeMX 管 DMA 时用这一版：句柄、时钟、NVIC、中断入口全部自己来。**`LCD_DMA_FillBuffer()` 与 8.4.3 的代码逐字相同，只把句柄从 `&HDMA_LCD` 换成 `&hdma_lcd`**，这里不再重复。
+
+列表 10: 代码清单 8-4 DMA 刷屏驱动 · 完全手写版（lcd_dma.c）
+
+```c
+/* lcd_dma.c —— 方案 B：完全手写，不依赖 CubeMX 生成 DMA */
+#include "lcd_dma.h"
+
+static DMA_HandleTypeDef hdma_lcd;
+static volatile uint8_t  dma_busy = 0;
+
+static void LCD_DMA_CpltCallback(DMA_HandleTypeDef *hdma);
+static void LCD_DMA_ErrorCallback(DMA_HandleTypeDef *hdma);
+
+void LCD_DMA_Init(void)
+{
+  __HAL_RCC_DMA2_CLK_ENABLE();
+
+  hdma_lcd.Instance                 = DMA2_Stream0;
+  hdma_lcd.Init.Channel             = DMA_CHANNEL_0;          /* M2M 模式下通道号无效 */
+  hdma_lcd.Init.Direction           = DMA_MEMORY_TO_MEMORY;
+  hdma_lcd.Init.PeriphInc           = DMA_PINC_ENABLE;        /* 【源】帧缓冲逐个像素自增 */
+  hdma_lcd.Init.MemInc              = DMA_MINC_DISABLE;       /* 【目的】LCD 数据口固定不动 */
+  hdma_lcd.Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD;
+  hdma_lcd.Init.MemDataAlignment    = DMA_MDATAALIGN_HALFWORD;
+  hdma_lcd.Init.Mode                = DMA_NORMAL;
+  hdma_lcd.Init.Priority            = DMA_PRIORITY_HIGH;
+  hdma_lcd.Init.FIFOMode            = DMA_FIFOMODE_DISABLE;
+  hdma_lcd.Init.FIFOThreshold       = DMA_FIFO_THRESHOLD_FULL;
+  hdma_lcd.Init.MemBurst            = DMA_MBURST_SINGLE;
+  hdma_lcd.Init.PeriphBurst         = DMA_PBURST_SINGLE;
+
+  if (HAL_DMA_Init(&hdma_lcd) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  hdma_lcd.XferCpltCallback  = LCD_DMA_CpltCallback;
+  hdma_lcd.XferErrorCallback = LCD_DMA_ErrorCallback;
+
+  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
+}
+
+static void LCD_DMA_CpltCallback(DMA_HandleTypeDef *hdma)
+{
+  if (hdma == &hdma_lcd) dma_busy = 0;
+}
+
+static void LCD_DMA_ErrorCallback(DMA_HandleTypeDef *hdma)
+{
+  if (hdma == &hdma_lcd) dma_busy = 0;
+}
+
+/* 中断入口：写在 stm32f4xx_it.c 或本文件，全局只能有一份 */
+void DMA2_Stream0_IRQHandler(void)
+{
+  HAL_DMA_IRQHandler(&hdma_lcd);
+}
+```
+
+> **这一版要和 CubeMX 版二选一**：如果 CubeMX 里也勾了 MemToMem 和它的中断，`stm32f4xx_it.c` 里就已经有一份 `DMA2_Stream0_IRQHandler()`，再写一份必然链接失败。要么把 CubeMX 的 MemToMem 请求删掉，要么别用这一版。
+
+#### 8.4.6 要点分析
+
+1. **源/目的与自增位的配对（两版相同）**：M2M 模式下源地址进 PAR、目的地址进 M0AR，所以 `PeriphInc` 控制的是**源**（帧缓冲，要 ENABLE）、`MemInc` 控制的是**目的**（LCD 数据口，要 DISABLE）。按直觉配反了，现象是屏幕只显示第一个像素的颜色或整屏花屏——见 8.2 节的语义陷阱；
+2. **回调有两种挂法**：直接给结构体成员赋值（`hdma->XferCpltCallback = …`）或 `HAL_DMA_RegisterCallback()`。后者要求句柄处于 `READY` 状态（否则返回 `HAL_ERROR`），所以两版都把它放在 `HAL_DMA_Init()` 之后——CubeMX 版用注册接口，手写版用直接赋值，效果一致；
+3. **完成和出错都要解锁**：只解完成、不解错误，一次 DMA 错误就会让 `dma_busy` 永久为 1，屏幕"刷一次之后就再也不动"——这是最容易被误判成"屏坏了"的软件故障；
+4. **`0x2C` 必须在 `HAL_DMA_Start_IT()` 之前发**：DMA 只往数据口灌数据，不负责发命令。顺序反了，屏幕会显示上一次开窗区域的残留内容；
+5. **渲染阶段是纯 RAM 操作**：`LCD_RenderString()` 只写内部 SRAM，不产生任何 FSMC 周期，所以即使不用 DMA，这套"先渲染到缓冲、再一次性写屏"的结构也比"逐点 `LCD_DrawPoint`"快得多（少了 13 倍的开窗开销）；
+6. **`dma_busy` 不是必须的**：HAL 自己维护 `hdma->State`，搬运中再调 `HAL_DMA_Start_IT()` 会直接返回 `HAL_BUSY`。保留这个标志是为了"请求被拒"和"上一次没搬完"两种情况在代码里读起来更清楚，也方便出问题时用调试器看它卡在哪。
+
+**表 8-5 CubeMX 版专属的坑**（都是"编译能过、运行不对"那一类）：
+
+| 现象 | 原因 | 处理 |
+| --- | --- | --- |
+| 第一次刷屏正常，之后完全不动 | 没勾 "DMA2 Stream0 global interrupt"，完成中断进不来、`dma_busy` 永远为 1 | 回 CubeMX 勾上中断，重新生成 |
+| 链接报 `Symbol DMA2_Stream0_IRQHandler multiply defined` | 自己在 `lcd_dma.c` 里又写了一遍中断入口 | 删掉自己那份，用 `stm32f4xx_it.c` 里的 |
+| 编译报 `hdma_memtomem_dma2_stream0` 未定义 | `lcd_dma.c` 没 `#include "dma.h"` | 补上头文件（`extern` 声明在里面） |
+| 花屏 / 颜色错位 / 只显示一半 | 面板里 Data Width 用了 Word，而我们的计数是"像素个数" | 8.4.3 里已强制 HALFWORD；若还错，检查 `LCD_DATA_ADDR` 是否 16 位对齐 |
+| 昨天调好的今天又坏了 | 手改了 `dma.c`，重新 GENERATE CODE 被覆盖 | 参数纠正只写在 `lcd_dma.c` |
+| CubeMX 报 Stream 资源冲突 | 同一路 DMA2 Stream0 已被 ADC1 占用 | 把 LCD 换到 Stream1，改一行宏别名 |
+| 启动 `HAL_DMA_Start_IT()` 一直返回 `HAL_BUSY` | 上一次传输没收到 TC（中断被更高优先级长期屏蔽），或 `State` 卡在 BUSY | 用调试器看 `hdma.State`；必要时 `HAL_DMA_Abort()` 复位 |
+| 刷屏把别的 DMA 传输拖慢 | M2M 占满 AHB 带宽 | 降低 `Priority`，或把帧缓冲改小、分行搬 |
+
+> **初始化顺序**：`LCD_DMA_Init()` 只配 DMA、不写屏，所以放在 `MX_DMA_Init()` 之后任意位置都行；但**第一次 `LCD_DMA_FillBuffer()` 必须发生在 `LCD_Init()` 之后**（此时 FSMC 已配好、屏已退出 Sleep、`0x29` 已开显示）。CubeMX 生成的 `main()` 里 `MX_DMA_Init()` 排在 `MX_FSMC_Init()` 之前，这是正常的，不用调。
 
 ### 8.5 收益与并行的用法
 
