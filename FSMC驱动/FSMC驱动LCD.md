@@ -1751,7 +1751,7 @@ FSMC 本身**不产生 DMA 请求**（它是存储器接口，不是外设请求
 
 本节给两个版本，**对外接口完全一致**，8.4.4 的上层代码两版共用、一字不改：
 
-- **8.4.2 + 8.4.3 CubeMX 生成版（推荐）**：CubeMX 负责时钟、NVIC、句柄、中断入口，我们只补齐它给不了的三项；
+- **8.4.2 + 8.4.3 CubeMX 生成版（推荐）**：CubeMX 负责时钟、NVIC、句柄、中断入口，我们只补齐它给不了的那两处（分端自增、像素位宽）；
 - **8.4.5 完全手写版**：自己建句柄、自己开时钟、自己写 `DMA2_Stream0_IRQHandler()`。适合无 CubeMX 的工程，或要把这段代码搬进寄存器版/标准库版工程。
 
 #### 8.4.1 两版的分工
@@ -1835,7 +1835,7 @@ static void LCD_DMA_ErrorCallback(DMA_HandleTypeDef *hdma)
 }
 
 /**
-  * @brief  在 CubeMX 已初始化过的句柄上纠正三项参数，然后重新初始化并挂回调
+  * @brief  在 CubeMX 已初始化过的句柄上纠正它给不了的两项参数，重新初始化并挂回调
   * @note   ① 面板给不了"源自增 + 目的固定"，且 Data Width 常默认成 Word，
   *            所以这里必须覆盖成 PINC=ENABLE / MINC=DISABLE / 两端 HALFWORD。
   *            用 Word 时一次搬 4 字节，16 位 FSMC 上会错位花屏
@@ -1999,6 +1999,7 @@ void LCD_ShowString_DMA(uint16_t x, uint16_t y, uint16_t maxW, const char *str)
 ```c
 /* lcd_dma.c —— 方案 B：完全手写，不依赖 CubeMX 生成 DMA */
 #include "lcd_dma.h"
+#include "main.h"     /* Error_Handler() */
 
 static DMA_HandleTypeDef hdma_lcd;
 static volatile uint8_t  dma_busy = 0;
