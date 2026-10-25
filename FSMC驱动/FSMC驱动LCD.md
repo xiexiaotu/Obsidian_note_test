@@ -290,10 +290,10 @@ HCLK = 168MHz，1 个 HCLK 周期 = 1000/168 ≈ 5.95 ns。模式 B 下读写周
 ### 5.3 配置背光 PD2 与软件 I2C 总线
 
 1. **System Core → GPIO** → 点击 **PD2**，选 **GPIO_Output**；参数：Output level = Low（先关背光）、**Output Push-Pull**、Pull-up、Very High，User Label 填 `LCD_BL`；
+![](Pasted%20image%2020261025152609.png)
 2. 同一个 GPIO 面板里，把 **PA1 / PA0** 配置为 **Output Open Drain + Pull-up + Very High**（软件 I2C 的 SCL/SDA，与《IIC 通信》笔记 5.4 节完全一致，初始电平 High）；
 3. 若板子上 SYS_RSTA 不是系统复位而是普通 GPIO，则把它也配置为推挽输出，别名 `LCD_RST`；
 4. 如需串口辅助调试，照旧配置 USART1（PA9/PA10，115200-8-N-1）。
-
 ### 5.4 生成代码
 
 Project Manager 填工程名（如 `FSMC_LCD_Sensor`），工具链选 MDK-ARM 或 CubeIDE，建议勾选 *Generate peripheral initialization as a pair of .c/.h files per peripheral*，然后 **GENERATE CODE**。
@@ -365,6 +365,7 @@ MDK-ARM/
 ├── font_asc2_1608.c         ← 8×16 ASCII 点阵字库（唯一的数据文件）
 └── app_ui.c / app_ui.h      ← 显示层：版面布局 + 数值刷新（见 7.4 节）
 ```
+![](Pasted%20image%2020261025152747.png)
 
 > **文件名对照**：本笔记正文为叙述方便仍沿用 `bsp_` 前缀（`bsp_lcd` ↔ `LCD.h` / `lcd.c`，`bsp_soft_i2c` ↔ `iic.h` / `IIC.C`，`bsp_bh1750` ↔ `BH1750.H` / `bh1750.c`，`bsp_lis3dh` ↔ `LIS3DH.h` / `lisd3h.c`），**第 6 章的代码清单已经是工程里的实际文件内容**，可以逐字对拷。本工程实际只挂了 BH1750 + LIS3DH 两颗传感器，HTU21D / PCF8563 按同样思路加即可（见 7.4 节）。
 
