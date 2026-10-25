@@ -228,18 +228,26 @@ HCLK = 168MHz，1 个 HCLK 周期 = 1000/168 ≈ 5.95 ns。模式 B 下读写周
 写周期 twc  = (ADDSET+1) + (DATAST+1)      个 HCLK
 ```
 
-**ILI9341** 的 8080 接口时序要求（见其数据手册 AC Characteristics）：**写周期 tWC(min) ≈ 66 ns**、地址建立 tAST(min) ≈ 0 ns、数据建立 tDST(min) ≈ 10 ns。按 ADDSET = 4、DATAST = 4 计算：
+**ILI9341** 的 8080 接口时序要求（见其数据手册 AC Characteristics）：**写周期 tWC(min) ≈ 66 ns**、地址建立 tAST(min) ≈ 0 ns、数据建立 tDST(min) ≈ 10 ns。按 ADDSET = 5、DATAST = 15 计算：
 
 ```
-写周期 twc = ((4+1) + (4+1)) × 5.95 ns ≈ 59.5 ns ……略紧
-读周期 trc = ((4+1) + (4+1) + 2) × 5.95 ns ≈ 71.4 ns > 65 ns ✓
+写周期 twc = ((5+1) + (15+1)) × 5.95 ns ≈ 130.9 ns  ≫ 66 ns ✓
+读周期 trc = ((5+1) + (15+1) + 2) × 5.95 ns ≈ 142.8 ns ✓
 ```
 
-写周期略低于 66ns 的要求，实测大部分 ILI9341 屏仍能正常工作；若出现花屏或白屏，把 **DATAST 加大到 8**（twc ≈ 83ns）就十分稳妥。本笔记代码取 ADDSET = 4、DATAST = 8，留足余量——对秒级刷新传感器数据的应用来说，这点速度差异完全无感。
+这组值是**实测收敛的结果**，比手册要求宽了一倍：320×240 整屏 76800 个像素 × 130.9ns ≈ **10ms** 刷完一屏，对秒级刷新传感器数据的应用完全无感，换来的是**任何时序裕量不足的模组都能稳跑**。
 
-> **关于这两个式子的说明**：上面是工程上常用的经验式（模式 A / 模式 B 的差别在于读操作是否插入额外的总线周转时间，不同资料写法略有出入）。**对驱动的正确性而言，关键只有一条：时序要留够余量，最终以实测波形为准**——先按 ADDSET = 4、DATAST = 8 配好，能稳定刷屏就不必再抠；出现花屏就加 DATAST（每一步加 2~4），一直加到稳定为止。**DATAST 每加 1 就多约 6ns，加得越多刷屏越慢**：本笔记配置下一次 16 位写周期约 83ns，这也是后文计算"刷一屏要多少 CPU 时间"的基准（320×240 = 7.68 万像素 × 83ns ≈ **6.4ms**）。
+> **排查经验（本工程踩过的坑，值得记住）**：一开始怀疑"一次连写 76800 个像素、写到后面丢数据"，于是把 ADDSET 从 4 加到 5、DATAST 从 8 加到 15。**后来定位到真正原因是 MADCTL 的 MV 位（见 6.5 节），跟时序无关**——但放宽后的时序一直保留：它把"时序临界"这个变量彻底排除掉，后面调方向时才不会把"方向问题"误判成"时序问题"。**调屏的铁律是：一次只改一个变量，能用余量换来的确定性就不要吝啬。**
 
-> **排错直觉**：屏幕"能点亮但花屏/颜色错乱"多半是 DATAST 太小、数据还没稳定就被锁存；"完全白屏"多半是 FSMC 根本没配通（先查 NE1 与 A17 的引脚复用）。实测时先用纯色刷屏验证时序，再谈显示内容。
+> **关于这两个式子的说明**：上面是工程上常用的经验式（模式 A / 模式 B 的差别在于读操作是否插入额外的总线周转时间，不同资料写法略有出入）。**对驱动的正确性而言，关键只有一条：时序要留够余量，最终以实测波形为准**——先按 ADDSET = 5、DATAST = 15 配好，能稳定刷屏就不必再抠。**DATAST 每加 1 就多约 6ns，加得越多刷屏越慢**：本笔记配置下一次 16 位写周期约 **131ns**，这也是后文计算"刷一屏要多少 CPU 时间"的基准（320×240 = 7.68 万像素 × 131ns ≈ **10ms**）。
+
+> **排错直觉（按"命中率"排序）**：
+> 1. **画面能显示但右侧/尾部有一条花带或整块丢失** → 先查 MADCTL 是否带了 **MV 位**（详见 6.5 节），这是本工程真正的原因，跟时序没关系；
+> 2. **颜色错乱、随机色块** → DATAST 太小，数据未稳定即被锁存，加大 DATAST；
+> 3. **完全白屏** → FSMC 根本没配通，先查 NE1 与 A17 的引脚复用、Write Operation 是否 Enabled；
+> 4. **画面整体旋转 90°** → 方向问题，也是 MADCTL（6.5 节）。
+>
+> **先纯色刷屏、再自检图、最后才看内容**——这个顺序能把"硬件/时序/方向/内容"四类问题分开，一次只面对一个。
 
 ---
 
@@ -264,8 +272,8 @@ HCLK = 168MHz，1 个 HCLK 周期 = 1000/168 ≈ 5.95 ns。模式 B 下读写周
 | Memory type                               | LCD Interface | 本质就是 NOR 模式 B         |
 | LCD Register Select                       | A17           | RS 引脚 = PD12          |
 | Data                                      | 16 bits       | RGB565 一像素 16 位       |
-| Address setup time in HCLK clock cycles   | 4             | ADDSET = 4            |
-| Data setup time in HCLK clock cycles      | 8             | DATAST = 8（见 4.3 节计算） |
+| Address setup time in HCLK clock cycles   | 5             | ADDSET = 5            |
+| Data setup time in HCLK clock cycles      | 15            | DATAST = 15（见 4.3 节计算，twc ≈ 131ns） |
 | Bus turn around time in HCLK clock cycles | 0             | LCD 不需要               |
 | Extended mode                             | Disable       | 读写共用一套时序              |
 | Wait                                      | Disable       | ILI9341 不接 NWAIT     |
@@ -318,13 +326,13 @@ void MX_FSMC_Init(void)
   hsram1.Init.WriteBurst         = FSMC_WRITE_BURST_DISABLE;
   hsram1.Init.PageSize           = FSMC_PAGE_SIZE_NONE;
 
-  Timing.AddressSetupTime      = 4;    /* ADDSET：地址建立，4 个 HCLK ≈ 23.8ns */
+  Timing.AddressSetupTime      = 5;    /* ADDSET：地址建立，5 个 HCLK ≈ 29.8ns */
   Timing.AddressHoldTime       = 15;   /* 模式 B 下无效，随意 */
-  Timing.DataSetupTime         = 8;    /* DATAST：数据建立，8 个 HCLK ≈ 47.6ns */
+  Timing.DataSetupTime         = 15;   /* DATAST：数据建立，15 个 HCLK ≈ 89.3ns */
   Timing.BusTurnAroundDuration = 0;
   Timing.CLKDivision           = 16;   /* 异步模式无效，随意 */
   Timing.DataLatency           = 17;   /* 异步模式无效，随意 */
-  Timing.AccessMode            = FSMC_ACCESS_MODE_B;  /* 模式 B 模拟 8080 */
+  Timing.AccessMode            = FSMC_ACCESS_MODE_A;  /* CubeMX 的 LCD Interface 生成的是模式 A */
 
   if (HAL_SRAM_Init(&hsram1, &Timing, NULL) != HAL_OK)
   {
@@ -355,44 +363,82 @@ main.c                  ← 主循环：读传感器 → 刷新 LCD 显示
 
 ### 6.2 LCD 底层驱动
 
-列表 3: 代码清单 6-1 LCD 底层接口（bsp_lcd.h）
+列表 3: 代码清单 6-1 LCD 底层接口（bsp_lcd.h，与实际工程一致）
 
 ```c
-#ifndef __BSP_LCD_H
-#define __BSP_LCD_H
+#ifndef __LCD_H_
+#define __LCD_H_
 
 #include "stm32f4xx_hal.h"
 
-/* ---------- FSMC 地址宏（计算过程见第 4.2 节） ---------- */
-#define FSMC_LCD_BASE      ((uint32_t)0x60000000U)        /* NE1 区域1 基地址 */
-#define LCD_CMD_ADDR       (FSMC_LCD_BASE)                /* A17=0：命令 */
-#define LCD_DATA_ADDR      (FSMC_LCD_BASE | (1UL << 18))  /* A17=1：数据 */
+/* ---------- FSMC 地址映射（计算过程见 4.2 节） ----------
+   NE1 片选基址 0x60000000，RS 接 FSMC_A17。
+   16 位数据总线时，内部地址位 A[18] 才对应外部引脚 A17，
+   所以命令/数据切换的偏移量是 1<<18（不是 1<<17）。 */
+#define FSMC_LCD_BASE      ((uint32_t)0x60000000U)        /* NE1 片选，最低 16 位地址 */
+#define LCD_CMD_ADDR       (FSMC_LCD_BASE)                /* A17=0 → 命令 */
+#define LCD_DATA_ADDR      (FSMC_LCD_BASE | (1UL << 18))  /* A17=1 → 数据 */
 
 #define LCD_WRITE_CMD(c)   (*(__IO uint16_t *)(LCD_CMD_ADDR)  = (uint16_t)(c))
 #define LCD_WRITE_DATA(d)  (*(__IO uint16_t *)(LCD_DATA_ADDR) = (uint16_t)(d))
 
-/* ---------- 屏幕参数（ILI9341，240×320 屏按横屏使用 = 320×240） ---------- */
-#define LCD_WIDTH    320     /* 横屏后的宽（由 MADCTL = 0x28 得到） */
-#define LCD_HEIGHT   240     /* 横屏后的高 */
+/* ---------- 屏幕分辨率：横屏 320 x 240 ----------
+   注意：这两个宏同时是"逻辑坐标系"的边界，也是开窗裁剪的边界。
+   它们描述的是**使用方向**（横屏 320x240），不是面板出厂方向。 */
+#define LCD_WIDTH     320
+#define LCD_HEIGHT    240
 
-/* ---------- RGB565 常用颜色 ---------- */
+/* ---------- GRAM 起始偏移 ----------
+   个别模组的可视区在 GRAM 里不从 (0,0) 开始（常见于 ST7735 类，1~2 像素）。
+   ILI9341 一般填 0；若整幅画面整体偏移、边上多出一条杂色带，再试着调这里 */
+#define LCD_X_OFFSET  0
+#define LCD_Y_OFFSET  0
+
+/* ---------- 屏幕朝向（按实测标定，推导过程见 6.5 节） ----------
+   本屏 GRAM 就是 320 列 x 240 行；MADCTL 保持 0x00 时实测：
+       水平方向 = +X（列号越大越靠右）
+       垂直方向 = -Y（行号 0 在屏幕最下面）
+   于是逻辑坐标要这样落到 GRAM：GRAM_X = x、GRAM_Y = 239 - y。
+
+   两个开关用来兜底，反了就把对应值改一下：
+       LCD_SW_FLIP_Y = 1  上下翻转（本屏默认需要）
+       LCD_SW_FLIP_X = 1  左右镜像 */
+#define LCD_SW_FLIP_X  0
+#define LCD_SW_FLIP_Y  1
+
+/* ---------- 扫描方向：MADCTL(0x36) ----------
+   bit7 MY 行反向 | bit6 MX 列反向 | bit5 MV 行列交换 | bit3 BGR(R/B 互换)
+   本屏必须保持 0x00：一旦带上 MV(0x20)，可寻址列数会被换成 240，
+   x 在 240~319 的像素就全部写不进 GRAM —— 这就是"右侧 80 列丢失"的真因。
+   若红蓝颠倒，改成 0x08 */
+#define LCD_MADCTL     0x00
+
+/* ---------- 上电自检画面 ----------
+   1 = 开机先显示 3 秒测试图（白框 + 四角编号 + 16 级彩条），
+       用来看方向、镜像、以及有没有哪块区域没刷到；调好后改 0 */
+#define LCD_SELFTEST  1
+
+/* ---------- RGB565 颜色 ---------- */
+#define RGB565(r, g, b)  ((uint16_t)((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | ((b) >> 3)))
 #define WHITE   0xFFFF
 #define BLACK   0x0000
 #define RED     0xF800
 #define GREEN   0x07E0
 #define BLUE    0x001F
 #define YELLOW  0xFFE0
+#define GREY    0xC618
 
-/* ---------- 配色约定：白底黑字，与 main.c 的刷新逻辑保持一致 ---------- */
+/* ---------- 配色约定：白底黑字 ---------- */
 #define LCD_BG_COLOR   WHITE
 #define LCD_FG_COLOR   BLACK
 
-/* ---------- 字库：8×16 点阵，ASCII 0x20~0x7E 共 95 个字符 ----------
-   定义在 font_asc2_1608.c（本笔记同目录已提供），此处只是 extern 声明；
-   格式与取模顺序的说明见 6.3 节 */
+/* ---------- 字库：8x16 点阵，ASCII 0x20~0x7E 共 95 个字符 ----------
+   数据在 font_asc2_1608.c 里，每字符 16 字节，一字节一行，MSB 在左。
+   这里只是 extern 声明，**该 .c 文件必须加入工程**，否则链接报 undefined
+   （本工程最初就漏了这个文件，编译能过、链接一定失败，见 6.3 节） */
 extern const uint8_t asc2_1608[95][16];
 
-/* ---------- 背光：PD2，高电平点亮 ---------- */
+/* ---------- 背光：PD2 高电平点亮 ---------- */
 #define LCD_BL_ON()    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_2, GPIO_PIN_SET)
 #define LCD_BL_OFF()   HAL_GPIO_WritePin(GPIOD, GPIO_PIN_2, GPIO_PIN_RESET)
 
@@ -406,6 +452,7 @@ void LCD_Clear(uint16_t color);
 void LCD_ShowChar(uint16_t x, uint16_t y, char ch, uint16_t color, uint16_t bgcolor);
 void LCD_ShowString(uint16_t x, uint16_t y, uint16_t maxW,
                     uint16_t color, uint16_t bgcolor, const char *str);
+void LCD_SelfTest(void);
 
 #endif
 ```
@@ -429,7 +476,7 @@ void LCD_ShowString(uint16_t x, uint16_t y, uint16_t maxW,
 typedef struct {
   uint16_t cmd;
   uint8_t  nArgs;
-  uint16_t args[10];
+  uint16_t args[16];   /* 伽马表最长 15 个参数 —— 写 10 会直接编译报错 */
 } lcd_cmd_t;
 
 static const lcd_cmd_t lcd_vendor_init[] = {
@@ -489,9 +536,14 @@ static void LCD_REG_Config(void)
                    sizeof(lcd_vendor_init) / sizeof(lcd_vendor_init[0]));
 
   LCD_WRITE_CMD(0x3A);  LCD_WRITE_DATA(0x55);   /* 像素格式 = RGB565（16bit/pixel） */
-  LCD_WRITE_CMD(0x36);  LCD_WRITE_DATA(0x28);   /* MADCTL：0x28 = MV+BGR = 横屏 320×240 */
   LCD_WRITE_CMD(0x11);                          /* Sleep Out */
-  HAL_Delay(120);
+  HAL_Delay(120);                               /* 手册要求 120ms 才允许发后续命令 */
+
+  /* 0x36(MADCTL) 放在 Sleep Out 之后：ST7789 / GC9306 这类控制器在睡眠状态下
+     会直接忽略 MADCTL。本屏取 0x00（原因见 6.5 节，千万别加 MV 位） */
+  LCD_WRITE_CMD(0x36);  LCD_WRITE_DATA(LCD_MADCTL);
+  HAL_Delay(10);
+
   LCD_WRITE_CMD(0x29);                          /* Display ON */
 }
 
@@ -524,8 +576,21 @@ void LCD_OpenWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
   /* 裁掉超出屏幕的部分，保证窗口合法 */
   if ((uint32_t)x + w > LCD_WIDTH)  w = LCD_WIDTH  - x;
   if ((uint32_t)y + h > LCD_HEIGHT) h = LCD_HEIGHT - y;
-  x2 = x + w - 1;
-  y2 = y + h - 1;
+
+  /* 逻辑坐标 → GRAM 坐标（本屏水平 +X、垂直 -Y，见 6.5 节）
+     翻转时窗口起点要换成"另一端"，否则填出来的块会整体跑偏 */
+#if LCD_SW_FLIP_X
+  x = (uint16_t)((LCD_WIDTH - 1) - (x + w - 1));
+#endif
+#if LCD_SW_FLIP_Y
+  y = (uint16_t)((LCD_HEIGHT - 1) - (y + h - 1));
+#endif
+
+  x  = (uint16_t)(x + LCD_X_OFFSET);
+  y  = (uint16_t)(y + LCD_Y_OFFSET);
+
+  x2 = (uint16_t)(x + w - 1);
+  y2 = (uint16_t)(y + h - 1);
 
   LCD_WRITE_CMD(0x2A);                     /* X 坐标范围 */
   LCD_WRITE_DATA(x  >> 8); LCD_WRITE_DATA(x  & 0xFF);
@@ -570,7 +635,17 @@ void LCD_Fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color)
 
 void LCD_Clear(uint16_t color)
 {
-  LCD_Fill(0, 0, LCD_WIDTH, LCD_HEIGHT, color);
+  uint16_t y;
+
+  /* 分段填充：一次连写 76800 个像素对时序裕量小的模组不够稳，
+     切成 12 段、每段重新开窗，单段只有 6400 个像素，可靠得多。
+     代价只是多 11 次开窗（132 次总线写），相对 76800 次像素写可忽略 */
+  for (y = 0; y < LCD_HEIGHT; y = (uint16_t)(y + 20))
+  {
+    uint16_t h = (uint16_t)(((LCD_HEIGHT - y) > 20) ? 20 : (LCD_HEIGHT - y));
+
+    LCD_Fill(0, y, LCD_WIDTH, h, color);
+  }
 }
 
 /**
@@ -607,12 +682,26 @@ void LCD_ShowChar(uint16_t x, uint16_t y, char ch, uint16_t color, uint16_t bgco
 
   LCD_OpenWindow(x, y, 8, 16);
   LCD_WRITE_CMD(0x2C);
+
+  /* 窗口第一个地址落在哪一端，决定了字模该从哪一行/哪一列开始送：
+       Y 反向时，窗口起点是字符的最底行 → 从 font[15] 往上送
+       X 反向时，窗口起点是字符的最右列 → 从 bit0 往 bit7 送
+     漏改这一处，字符就会上下颠倒（画面其他部分却是正的） */
   for (row = 0; row < 16; row++)
   {
-    data = font[row];                      /* 一行 8 个像素，MSB 在左 */
+#if LCD_SW_FLIP_Y
+    data = font[15 - row];
+#else
+    data = font[row];
+#endif
+
     for (bit = 0; bit < 8; bit++)
     {
+#if LCD_SW_FLIP_X
+      LCD_WRITE_DATA((data & (0x01 << bit)) ? color : bgcolor);
+#else
       LCD_WRITE_DATA((data & (0x80 >> bit)) ? color : bgcolor);
+#endif
     }
   }
 }
@@ -632,6 +721,56 @@ void LCD_ShowString(uint16_t x, uint16_t y, uint16_t maxW,
     x += 8;
     str++;
   }
+}
+
+/**
+  * @brief  上电自检画面：一眼看出方向对不对、有没有镜像、有没有没刷到的区域
+  * @note   正着看应该是：四条白边闭合、左上 1(红) 右上 2(绿) 左下 3(蓝) 右下 4(黄)、
+  *         16 条彩条从左到右铺满整宽。
+  *         1 和 2 对调 → 左右镜像，改 LCD_SW_FLIP_X
+  *         1 和 3 对调 → 上下颠倒，改 LCD_SW_FLIP_Y
+  *         白框某条边缺一段/那块是雪花 → 该区域根本没被寻址到（查 MADCTL 的 MV）
+  */
+void LCD_SelfTest(void)
+{
+  static const uint16_t bars[8] = {
+    RED, GREEN, BLUE, YELLOW, 0x07FF, 0xF81F, WHITE, 0x8410
+  };
+  uint16_t i, x;
+
+  LCD_Clear(BLACK);
+
+  /* 1. 四边白框（四条边都在，才说明整个可视区都被寻址到了） */
+  LCD_Fill(0, 0, LCD_WIDTH, 1, WHITE);
+  LCD_Fill(0, (uint16_t)(LCD_HEIGHT - 1), LCD_WIDTH, 1, WHITE);
+  LCD_Fill(0, 0, 1, LCD_HEIGHT, WHITE);
+  LCD_Fill((uint16_t)(LCD_WIDTH - 1), 0, 1, LCD_HEIGHT, WHITE);
+
+  /* 2. 顶部每 40 像素一个刻度，画面被拉伸/压缩会立刻看出来 */
+  for (x = 40; x < LCD_WIDTH; x = (uint16_t)(x + 40))
+  {
+    LCD_Fill(x, 1, 1, 5, WHITE);
+  }
+
+  /* 3. 中间 16 条彩条，铺满整个宽度 */
+  for (i = 0; i < 16; i++)
+  {
+    LCD_Fill((uint16_t)(i * 20), 70, 20, 80, bars[i & 0x07]);
+  }
+
+  /* 4. 四角编号 */
+  LCD_Fill(8, 10, 40, 22, RED);
+  LCD_ShowString(24, 13, 40, WHITE, RED, "1");
+  LCD_Fill((uint16_t)(LCD_WIDTH - 48), 10, 40, 22, GREEN);
+  LCD_ShowString((uint16_t)(LCD_WIDTH - 32), 13, 40, WHITE, GREEN, "2");
+  LCD_Fill(8, (uint16_t)(LCD_HEIGHT - 32), 40, 22, BLUE);
+  LCD_ShowString(24, (uint16_t)(LCD_HEIGHT - 29), 40, WHITE, BLUE, "3");
+  LCD_Fill((uint16_t)(LCD_WIDTH - 48), (uint16_t)(LCD_HEIGHT - 32), 40, 22, YELLOW);
+  LCD_ShowString((uint16_t)(LCD_WIDTH - 32), (uint16_t)(LCD_HEIGHT - 29),
+                 40, BLACK, YELLOW, "4");
+
+  /* 5. 一行文字，顺便确认字库与取模顺序 */
+  LCD_ShowString(96, 170, 128, WHITE, BLACK, "SELFTEST 320X240");
 }
 ```
 
