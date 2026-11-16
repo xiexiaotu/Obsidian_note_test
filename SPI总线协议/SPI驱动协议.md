@@ -206,17 +206,17 @@ STM32 的引脚是"复用"的：同一个物理引脚，靠寄存器里写入的
 
 **表 1-6 本项目的最终引脚分配表（写进 CubeMX 之前先核对这张表）**
 
-| 器件 | 信号 | STM32 引脚 | 引脚模式 | 复用编号 | 备注 |
-| --- | --- | --- | --- | --- | --- |
-| W25Q64 | CS#（片选） | **PA15** | GPIO_Output | — | 软件片选，低有效；需释放 JTDI |
-| W25Q64 | CLK | **PB3** | AF_PP | **AF6**（SPI3） | 需释放 JTDO |
-| W25Q64 | DO（MISO） | **PB4** | AF_PP | **AF6**（SPI3） | 需释放 NJTRST |
-| W25Q64 | DI（MOSI） | **PB5** | AF_PP | **AF6**（SPI3） | PB5 不是 JTAG 引脚，无需释放 |
-| TF 卡 | CS | **PA4** | GPIO_Output | — | 软件片选，低有效 |
-| TF 卡 | SCK | **PA5** | AF_PP | **AF5**（SPI1） | — |
-| TF 卡 | MISO | **PA6** | AF_PP | **AF5**（SPI1） | — |
-| TF 卡 | MOSI | **PA7** | AF_PP | **AF5**（SPI1） | — |
-| 调试 | SWDIO / SWCLK | PA13 / PA14 | SYS | — | **必须保留**，不要挪用 |
+| 器件     | 信号            | STM32 引脚    | 引脚模式        | 复用编号          | 备注                  |
+| ------ | ------------- | ----------- | ----------- | ------------- | ------------------- |
+| W25Q64 | CS#（片选）       | **PA15**    | GPIO_Output | —             | 软件片选，低有效；需释放 JTDI   |
+| W25Q64 | CLK           | **PB3**     | AF_PP       | **AF6**（SPI3） | 需释放 JTDO            |
+| W25Q64 | DO（MISO）      | **PB4**     | AF_PP       | **AF6**（SPI3） | 需释放 NJTRST          |
+| W25Q64 | DI（MOSI）      | **PB5**     | AF_PP       | **AF6**（SPI3） | PB5 不是 JTAG 引脚，无需释放 |
+| TF 卡   | CS            | **PA4**     | GPIO_Output | —             | 软件片选，低有效            |
+| TF 卡   | SCK           | **PA5**     | AF_PP       | **AF5**（SPI1） | —                   |
+| TF 卡   | MISO          | **PA6**     | AF_PP       | **AF5**（SPI1） | —                   |
+| TF 卡   | MOSI          | **PA7**     | AF_PP       | **AF5**（SPI1） | —                   |
+| 调试     | SWDIO / SWCLK | PA13 / PA14 | SYS         | —             | **必须保留**，不要挪用       |
 
 > **为什么不把片选也交给 SPI 外设的 NSS 引脚**：SPI 外设的硬件 NSS 只适合"总线上只有一个从机、且用标准时序"的场合。一旦总线上要挂多个器件，或者器件要求"命令之间拉高 CS 复位状态机"（W25Q64 和 TF 卡都属于这一类），就必须用**普通 GPIO 软件控制 CS**。野火第 24 章也明确采用软件 NSS（`SPI_NSS_SOFT`），本章沿用。
 
