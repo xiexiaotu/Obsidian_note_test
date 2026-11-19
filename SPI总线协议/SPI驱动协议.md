@@ -2034,8 +2034,6 @@ int W25Q64_ChipErase(void)
  */
 static int W25Q64_PageWrite(uint32_t addr, uint8_t *pData, uint16_t len)
 {
-  uint16_t i;
-
   if (len == 0 || len > W25Q64_PAGE_SIZE)
   {
     return W25Q64_ERR_PARAM;
@@ -2047,10 +2045,7 @@ static int W25Q64_PageWrite(uint32_t addr, uint8_t *pData, uint16_t len)
   W25Q64_CS_LOW();
   W25Q64_SendByte(W25X_PageProgram);        /* 0x02 */
   W25Q64_SendAddr(addr);
-  for (i = 0; i < len; i++)
-  {
-    W25Q64_SendByte(pData[i]);              /* 逐字节发数据，芯片内部地址自增 */
-  }
+  W25Q64_SendBytes(pData, len);             /* 一次发完，芯片内部地址自增 */
   W25Q64_CS_HIGH();
 
   return W25Q64_WaitForWriteEnd();          /* 等页编程完成（约 0.7ms） */
@@ -3440,4 +3435,575 @@ void TF_DumpBlock0(void)
 
 ---
 
-<!--CHUNK-END-->
+## 任务九　双器件共存调度与联调
+
+> **本任务的目标**：把两块器件放进一个工程里跑起来，验证**分时复用是真的安全**——两块器件交替读写不串数据、不掉状态。**这是对任务五总线层的最终考核。**
+
+### 环节一　调度策略
+
+#### 技能点 1　三种共存模式
+
+##### 知识点 1　模型对比
+
+**表 9-1 双器件共存的三种调度模型**
+
+| 模型 | 做法 | 优点 | 缺点 | 适用 |
+| --- | --- | --- | --- | --- |
+| **A：顺序轮询** | 主循环里依次做 FLASH 任务、TF 卡任务 | 简单、无竞争 | 长任务会阻塞另一个 | **本项目** |
+| B：状态机分片 | 每次主循环只做一步，用状态变量推进 | 响应快、无阻塞 | 代码复杂度高 | 有实时要求时 |
+| C：定时器中断 + 标志 | 中断里置标志，主循环检查执行 | 时序精确 | 中断里不能做慢操作 | 周期采集 |
+
+> **本项目选 A 的理由**：两块器件的操作都是"短事务"（毫秒级），顺序执行完全够用。**而且顺序执行天然避免了"两个器件同时要求总线"的竞争问题**——这是分时复用在软件层最省事的做法。
+
+##### 知识点 2　主程序骨架
+
+```c
+/* main.c 的 USER CODE BEGIN 2 区域 */
+int main(void)
+{
+  HAL_Init();
+  SystemClock_Config();          /* 168MHz：PCLK2 = 84MHz（SPI1 时钟源） */
+  MX_GPIO_Init();                /* PA4/PA15/PA5~PA7/PB3~PB5 */
+  MX_SPI1_Init();                /* SPI1：模式 0、÷4（初值） */
+  MX_USART1_UART_Init();         /* 115200-8-N-1 */
+
+  printf("\r\n========== SPI 存储项目启动 ==========\r\n");
+
+  /* ---------- 第一阶段：总线层自检 ---------- */
+  BUS_Init();
+  BUS_SelfTest();
+
+  /* ---------- 第二阶段：两个器件各自初始化 ---------- */
+  int flash_ok = (W25Q64_Init() == W25Q64_OK) ? 1 : 0;
+  int tf_ok    = (TF_Init()     == TF_OK)     ? 1 : 0;
+
+  printf("\r\n[自检汇总] FLASH: %s   TF卡: %s\r\n\r\n",
+         flash_ok ? "正常" : "异常",
+         tf_ok    ? "正常" : "异常");
+
+  /* ---------- 第三阶段：功能测试 ---------- */
+  if (flash_ok) { W25Q64_Test(); W25Q64_TestCrossPage(); W25Q64_TestFullSector(); }
+  if (tf_ok)    { TF_DumpBlock0(); TF_Test(); }
+
+  /* ---------- 第四阶段：交替读写压测 ---------- */
+  if (flash_ok && tf_ok) DualDeviceStressTest();
+
+  /* ---------- 第五阶段：周期任务 ---------- */
+  uint32_t lastTick = HAL_GetTick();
+  while (1)
+  {
+    if ((HAL_GetTick() - lastTick) >= 5000)
+    {
+      lastTick = HAL_GetTick();
+      /* 周期性记录一条日志到 FLASH，同时刷一次 TF 卡状态（演示共存调度） */
+      static uint32_t seq = 0;
+      char log[64];
+      int n = snprintf(log, sizeof(log), "tick=%lu seq=%lu\r\n",
+                       (unsigned long)HAL_GetTick(), (unsigned long)seq++);
+      /* W25Q64_ChipErase 之类长操作绝不要放在主循环高频段 */
+      (void)n;
+    }
+  }
+}
+```
+
+#### 技能点 2　交替读写压测
+
+##### 知识点 1　压测程序
+
+```c
+/**
+ * @brief  双器件交替读写压测：模拟"FLASH 存参数、TF 卡存文件"的真实场景
+ * @note   每轮都写不同内容，能抓出"切换没生效导致读到上次缓存"的隐蔽 bug
+ */
+void DualDeviceStressTest(void)
+{
+  static uint8_t fbuf[256];
+  static uint8_t tbuf[TF_BLOCK_SIZE];
+  static uint8_t rbuf[TF_BLOCK_SIZE];
+  uint32_t round, i;
+  uint32_t fail = 0;
+
+  printf("\r\n========== 双器件交替读写压测（20 轮） ==========\r\n");
+
+  for (round = 0; round < 20; round++)
+  {
+    /* ---------- FLASH 侧：写 256 字节（每轮内容不同） ---------- */
+    for (i = 0; i < sizeof(fbuf); i++)
+    {
+      fbuf[i] = (uint8_t)(i + round);
+    }
+    if (W25Q64_EraseAndWrite(0x002000, fbuf, sizeof(fbuf)) != W25Q64_OK)
+    {
+      printf("  第 %lu 轮：FLASH 写失败\r\n", (unsigned long)round);
+      fail++;
+      continue;
+    }
+
+    /* ---------- TF 卡侧：写 512 字节（每轮内容不同） ---------- */
+    for (i = 0; i < TF_BLOCK_SIZE; i++)
+    {
+      tbuf[i] = (uint8_t)(i ^ round);
+    }
+    if (TF_WriteBlock(3000, tbuf) != TF_OK)
+    {
+      printf("  第 %lu 轮：TF 写失败\r\n", (unsigned long)round);
+      fail++;
+      continue;
+    }
+
+    /* ---------- 反过来读：先读 TF，再读 FLASH ----------
+       顺序故意与写入相反，确保每次都真的发生了总线切换 */
+    memset(rbuf, 0, sizeof(rbuf));
+    if (TF_ReadBlock(3000, rbuf) != TF_OK || memcmp(tbuf, rbuf, TF_BLOCK_SIZE) != 0)
+    {
+      printf("  第 %lu 轮：TF 读校验失败\r\n", (unsigned long)round);
+      fail++;
+      continue;
+    }
+
+    memset(fbuf, 0, sizeof(fbuf));
+    if (W25Q64_ReadBuffer(0x002000, fbuf, 256) != W25Q64_OK)
+    {
+      printf("  第 %lu 轮：FLASH 读失败\r\n", (unsigned long)round);
+      fail++;
+      continue;
+    }
+    for (i = 0; i < 256; i++)
+    {
+      if (fbuf[i] != (uint8_t)(i + round))
+      {
+        printf("  第 %lu 轮：FLASH 读校验失败（第 %lu 字节）\r\n",
+               (unsigned long)round, (unsigned long)i);
+        fail++;
+        break;
+      }
+    }
+  }
+
+  if (fail == 0)
+    printf("★ 20 轮交替读写全部通过，分时复用工作正常\r\n");
+  else
+    printf("✗ 共 %lu 轮失败，请检查 BUS_Select 的切换逻辑\r\n", (unsigned long)fail);
+}
+```
+
+> **为什么要"写 A 读 B"而不是"写完立刻读同一个"**：如果切换没生效，写完 FLASH 立刻读 FLASH 会**读到正确数据**（因为总线还连着它）——这个 bug 就藏住了。**必须交叉操作，才能暴露"该切的时候没切"。**
+
+##### 知识点 2　这个测试能抓出什么
+
+**表 9-2 交替压测能暴露的四类 bug**
+
+| 被暴露的 bug | 现象 | 根因 |
+| --- | --- | --- |
+| `BUS_Select` 引脚分支写反 | FLASH 读写正常，TF 卡全错 | TF/FLASH 的引脚组对应关系颠倒 |
+| 切换时漏了 `__HAL_SPI_DISABLE` | 模式没真正改，第二个器件时序出错 | CR1 在 SPE=1 时只读 |
+| 状态缓存判断错 | 偶尔读到上一个器件的数据 | `s_currentDev` 与实际不符 |
+| 切换时 CS 没拉高 | 从机器件状态机错位，偶发失败 | 切换前必须 `BUS_DeselectAll()` |
+
+---
+
+### 环节二　容错设计与代码规范
+
+#### 技能点 1　统一错误码
+
+##### 知识点 1　三层错误码对照
+
+**表 9-3 三层错误码体系**
+
+| 层 | 错误码前缀 | 示例 | 谁来处理 |
+| --- | --- | --- | --- |
+| 总线层 | （不返回，由 HAL 状态体现） | `HAL_TIMEOUT` → 返回 `0xFF` | 驱动层判 |
+| **FLASH 驱动** | `W25Q64_ERR_*` | `W25Q64_ERR_TIMEOUT` | 应用层判 |
+| **TF 卡驱动** | `TF_ERR_*` | `TF_ERR_NO_CARD` | 应用层判 |
+
+> **统一错误码的价值**：上层代码可以统一处理，不用为每个函数单独写一遍。**更重要的是——错误码能让你在三个月后回看这段代码时，一眼知道当时卡在哪一步。**
+
+##### 知识点 2　把调试信息做成宏开关
+
+```c
+/* bsp_common.h */
+#ifndef __BSP_COMMON_H
+#define __BSP_COMMON_H
+
+#include <stdio.h>
+
+#define BSP_DEBUG_ENABLE   1
+
+#if BSP_DEBUG_ENABLE
+  #define BSP_LOG(fmt, ...)   printf(fmt, ##__VA_ARGS__)
+#else
+  #define BSP_LOG(fmt, ...)   ((void)0)
+#endif
+
+#endif
+```
+
+> **为什么不在驱动里直接写 printf**：驱动里到处 printf 会让代码臃肿，而且量产时要去掉很麻烦。**用一个宏统一开关，调试期打开、发布期关闭**，是工程上的标准做法。
+> 本笔记为了教学清晰，代码里直接用了 `printf`；**实际项目里请替换成 `BSP_LOG`**。
+
+#### 技能点 2　代码组织与命名
+
+##### 知识点 1　最终工程结构
+
+```
+SPI_Storage/
+├── Core/
+│   ├── Inc/
+│   │   ├── main.h                 ← CubeMX 生成（含引脚宏）
+│   │   ├── spi.h                  ← CubeMX 生成
+│   │   ├── bsp_common.h           ← ★ 自写：日志宏、通用返回码
+│   │   ├── bsp_spi1_bus.h         ← ★ 自写：SPI1 分时复用（任务五）
+│   │   ├── bsp_w25q64.h           ← ★ 自写：W25Q64（任务六）
+│   │   └── bsp_tfcard.h           ← ★ 自写：TF 卡（任务八）
+│   └── Src/
+│       ├── main.c
+│       ├── spi.c                  ← CubeMX 生成（勿改）
+│       ├── bsp_spi1_bus.c         ← ★ 自写
+│       ├── bsp_w25q64.c           ← ★ 自写
+│       ├── bsp_tfcard.c           ← ★ 自写
+│       └── app_storage.c          ← ★ 自写：测试与业务（任务七、九）
+└── Drivers/                       ← HAL 库，不动
+```
+
+##### 知识点 2　命名规范
+
+**表 9-4 本项目采用的命名规范**
+
+| 类型 | 前缀/风格 | 示例 |
+| --- | --- | --- |
+| 文件 | `bsp_` + 器件名 | `bsp_w25q64.c` |
+| 公开函数 | `器件名_` + 动作 | `W25Q64_ReadBuffer` |
+| 内部函数 | `static` + 同前缀 | `static int W25Q64_PageWrite(...)` |
+| 宏 | 全大写 + 下划线 | `W25Q64_PAGE_SIZE` |
+| 全局变量 | `g_` 前缀 | `g_tfInfo` |
+| 局部静态变量 | `s_` 前缀 | `s_currentDev` |
+| 类型 | `_t` / `_T` 后缀 | `TF_Info_t`、`BUS_DEV` |
+
+> **`bsp_` 前缀的含义**：Board Support Package，指"板级支持包"——**专门用来隔离"硬件细节"与"业务逻辑"**。业务代码只调 `W25Q64_ReadBuffer()`，不关心底下是 SPI1 分时复用还是 SPI3 独占。将来换板子，只改 `bsp_` 层，业务代码一行不动。
+
+---
+
+### 环节三　验收清单
+
+#### 技能点 1　逐项验收
+
+##### 知识点 1　十四条验收清单
+
+**表 9-5 项目验收清单（全部打勾才算完成）**
+
+| 序号 | 验收项 | 通过标准 | 关联任务 |
+| --- | --- | --- | --- |
+| 1 | CubeMX 无引脚冲突警告 | 生成时无黄色/红色告警 | 任务四 |
+| 2 | 工程编译 0 错误 0 警告 | 编译器输出 | 任务四 |
+| 3 | 调试器能连接、能单步 | Keil/CubeIDE 正常下载调试 | 任务一 |
+| 4 | **总线层自检** | FLASH 位置读到 `EF 40 17`，TF 位置读到 `01` | 任务五 |
+| 5 | **切换时只有一个 SCK 活动** | 示波器：PA5 与 PB3 不同时出波形 | 任务五 |
+| 6 | W25Q64 读 ID 正确 | `0xEF4017` | 任务六 |
+| 7 | W25Q64 擦 + 写 + 读回一致 | 回环校验通过 | 任务七 |
+| 8 | W25Q64 跨页写入正确 | 300 字节跨页测试通过 | 任务七 |
+| 9 | W25Q64 整扇区写入正确 | 4KB 测试通过，耗时约 50ms | 任务七 |
+| 10 | W25Q64 掉电保持 | 断电重启后数据完好 | 任务七 |
+| 11 | TF 卡检测到卡 | `TF_Check()` 返回 `TF_OK` | 任务八 |
+| 12 | TF 卡初始化完成 | 识别出版本与寻址方式 | 任务八 |
+| 13 | TF 卡单块读写一致 | 512 字节回环校验通过 | 任务八 |
+| 14 | **双器件交替压测** | 20 轮交叉读写全部通过 | 任务九 |
+
+##### 知识点 2　第 5 项：为什么单列一条
+
+**"切换时只有一个 SCK 活动"** 是分时复用正确性的**物理层铁证**。即使软件一切看起来正常，如果这条不满足，就意味着**两组引脚同时挂在 SPI1 上**——后果是：
+
+- 现在可能"碰巧"能工作（因为两个器件不是同时驱动 MISO）；
+- 但换个器件、换批芯片、温度一变，就可能出现**随机误码**；
+- 更糟的是**两个推挽输出长期对打**，会缓慢损伤引脚。
+
+> **这条必须用示波器验证，软件测不出来。** 这是本项目唯一一条"必须借助仪器"的验收项。
+
+#### 技能点 2　完整验证报告
+
+##### 知识点 1　正常的串口输出
+
+```
+========== SPI 存储项目启动 ==========
+
+===== SPI1 总线层自检 =====
+[总线] FLASH 位置读到 ID = EF 40 17（期望 EF 40 17）
+[总线] TF 卡位置读到 R1 = 01（期望 01）
+[总线] 自检完成，当前器件 = 1
+
+[W25Q64] JEDEC ID = 0xEF4017
+[W25Q64] 检测到 W25Q64（8MB），自检通过
+[TF] 检测到卡（CMD0 响应 0x01，空闲态）
+[TF] CMD8 响应正常，v2.0 卡
+[TF] 高容量卡（SDHC/SDXC），块寻址，单块 512 字节
+[TF] 初始化成功（块寻址，21 MHz SCK）
+
+[自检汇总] FLASH: 正常   TF卡: 正常
+
+========== W25Q64 读写测试 ==========
+[测试] 目标区域已是空白，跳过擦除（省 45ms）
+[测试] 写入 256 字节完成
+★ 回环校验通过：写入与读出完全一致
+  读出前 32 字节：ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEF
+
+===== 跨页写入测试（addr=0x000010, len=300）=====
+★ 跨页写入正确（pageRemain 拆分逻辑有效）
+
+===== 整扇区写入测试（4KB）=====
+擦 + 写 4KB 耗时 53 ms（预期约 48~55ms）
+★ 整扇区写入校验通过
+
+[TF] 块 0 前 16 字节：EB 3C 90 4D 53 44 4F 53 35 2E 30 00 02 08 01 00
+[TF] 检测到有效引导扇区（卡已格式化）
+
+========== TF 卡读写测试 ==========
+[TF] 块 2048 预读成功，首字节 0xFF
+[TF] 写入 512 字节完成
+★ TF 卡块回环校验通过
+[TF] 读回内容：TF-CARD SPI TEST OK!
+
+========== 双器件交替读写压测（20 轮） ==========
+★ 20 轮交替读写全部通过，分时复用工作正常
+```
+
+##### 知识点 2　这份输出为什么这么"啰嗦"
+
+每一条打印都对应一个**可独立判定的检查点**：
+
+- `[总线] FLASH 位置读到 ID = EF 40 17` → **总线层切到了 FLASH 且 AF5 正确**；
+- `[总线] TF 卡位置读到 R1 = 01` → **总线层切到了 TF 卡且模式 0 正确**；
+- `[W25Q64] JEDEC ID` → 指令、地址、时序全对；
+- `[TF] CMD8 响应正常` → SD 协议栈第一步成功；
+- `[TF] 高容量卡（SDHC）` → CMD58 读到了 OCR，寻址方式确定；
+- `★ 20 轮交替读写全部通过` → **分时复用真正经受住了考核**。
+
+> **一个原则：能打印的中间结论，都要打印出来。** 因为嵌入式调试没有断点、没有日志文件、没有 crash dump，**串口就是唯一的"黑匣子"**。**打点越细，定位越快。**
+
+---
+
+## 任务十　项目小结与延伸
+
+> **本任务的目标**：把整条知识链收拢，并指出下一步该往哪走。
+
+### 环节一　回顾整条链路
+
+#### 技能点 1　从协议到项目的总结
+
+##### 知识点 1　一句话总结
+
+> **SPI 协议用四根线 + 四种模式定义了"位怎么传"；STM32 的 SPI1 外设把它做成硬件；HAL 库包成四个 API；W25Q64 与 TF 卡在 API 之上各自用"指令集/命令集"定义自己的语义。而本项目最特殊的一层，是"用软件让一个 SPI1 分时服务两个器件"的总线层。**
+
+##### 知识点 2　七级知识链路
+
+```
+物理层（四根线）
+    → 协议层（CPOL/CPHA 四种模式）
+        → 外设层（CR1/SR/HAL API）
+            → 引脚复用层（AF5 切换 ← 本项目核心）
+                → 器件层（W25Q64 指令 / TF 卡 CMD 状态机）
+                    → 驱动层（bsp_w25q64.c / bsp_tfcard.c）
+                        → 应用层（测试、日志、文件系统）
+```
+
+**每往上一层，屏蔽的细节就多一层**：应用层调 `W25Q64_ReadBuffer()` 时，完全不用知道底下是 SPI1、是 AF5 切换、是模式 3、是 21MHz。**分层不是为了好看，是为了"出问题时你能快速定位到哪一层"**：
+
+- ID 读不到 → 看**引脚复用层及以下**（AF5、模式、`BUS_Select`）；
+- ID 能读但写不进 → 看**器件层**（写使能、擦除、忙等待）；
+- 单条命令能跑但交替跑出错 → 看**引脚复用层**（CS 时序、状态缓存）。
+
+#### 技能点 2　本项目的三条独特经验
+
+##### 知识点 1　三条经验
+
+1. **"一个外设只能接一组引脚"是硬约束，不是配置问题**
+   遇到"两个器件都要用 SPI1"的需求时，**不要试图在 CubeMX 里同时点亮两组引脚**——那是做不到的。正确思路是"分时复用"或"换外设"，两者各有代价。
+
+2. **分时复用的安全性靠三件事：先拉高 CS、再换引脚、最后改模式**
+   顺序错了就会出现"偶发失败"这种最难查的问题。**固定顺序 + 代码注释**，比什么都重要。
+
+3. **"能用"和"可靠"之间隔着完整的测试**
+   单器件测试通过不代表分时复用正确；必须用**交叉读写压测**才能暴露切换 bug，用**示波器**才能证明物理层没冲突。
+
+### 环节二　延伸方向
+
+#### 技能点 1　三条延伸路线
+
+##### 知识点 1　延伸路线表
+
+**表 10-1 本项目的三条进阶路线**
+
+| 方向 | 要做什么 | 涉及技术 | 难度 |
+| --- | --- | --- | --- |
+| **提速** | 用 DMA 替代阻塞式收发 | `HAL_SPI_TransmitReceive_DMA()`、双缓冲 | ⭐⭐ |
+| **上文件系统** | 移植 FatFs 到 TF 卡 | 实现五个 `disk_*` 函数、配置 `ffconf.h` | ⭐⭐⭐ |
+| **做产品** | 日志系统、掉电保护、磨损均衡 | 环形日志、双备份、写前校验 | ⭐⭐⭐⭐ |
+
+##### 知识点 2　FatFs 移植需要的五个函数
+
+**表 10-2 FatFs 移植需要实现的五个底层函数**
+
+| 函数 | 作用 | 在本项目里的实现 |
+| --- | --- | --- |
+| `disk_initialize()` | 初始化磁盘 | 调 `TF_Init()` |
+| `disk_status()` | 查询状态 | 返回 `g_tfInfo.inited` |
+| `disk_read()` | 读扇区 | 循环调 `TF_ReadBlock()` |
+| `disk_write()` | 写扇区 | 循环调 `TF_WriteBlock()` |
+| `disk_ioctl()` | 控制（容量、扇区大小） | 返回 512 和 `g_tfInfo.capacityMB` |
+
+> **注意：TF 卡的扇区是 512 字节，而 W25Q64 的擦除单位是 4KB。** 如果要在 W25Q64 上跑 FatFs，必须实现"**读-改-写**"：先把整个 4KB 扇区读到 RAM，改其中 512 字节，擦整块，再写回。**这是 FLASH 上跑文件系统的核心难点**，也是为什么大多数工程选择在 TF 卡上跑 FatFs、在 W25Q64 上做小数据存储。
+
+##### 知识点 3　如果哪天要把 W25Q64 挪到 SPI3
+
+虽然本项目按需求"两个都用 SPI1"，但如果将来发现切换开销或冲突成为瓶颈，**PB3/PB4/PB5 天然支持 AF6（SPI3）**，迁移成本很低：
+
+1. CubeMX 里启用 **SPI3**，Mode = Full-Duplex Master，它会自动占用 PB3/PB4/PB5；
+2. `bsp_spi1_bus.c` 里把 `BUS_AttachAF5()` 改成 `GPIO_AF6_SPI3`；
+3. `BUS_Select()` 里 FLASH 分支改成操作 `hspi3` 而不是 `hspi1`；
+4. `bsp_w25q64.c` **一行都不用改**（因为它只依赖总线层）。
+
+> **这正是"分层"的回报**：当初多写的那个 `bsp_spi1_bus.c`，让"换总线"变成了一件只改一个文件的事。**这就是为什么专业项目一定要有 BSP 层。**
+
+---
+
+## 本章小结
+
+1. **SPI 是四线制（SCK/MOSI/MISO/NSS）、全双工、同步、推挽的串行总线**，靠 NSS 片选寻址，四种模式由 CPOL/CPHA 组合而成。**W25Q64 用模式 3、TF 卡用模式 0**，这是器件手册规定的。
+
+2. **本项目最核心的技术点是"一个 SPI1 服务两组引脚"**：SPI1 的 SCK 输出信号只能引到 `PA5` 或 `PB3` 之一，**不可能同时引到两处**。因此必须做 **SPI1 分时复用**：用谁就把谁接上（AF5），另一组切到模拟态隔离。
+
+3. **分时复用的切换顺序不能乱**：`__HAL_SPI_DISABLE()` → 两路 CS 都拉高 → 旧组引脚转模拟态 → 新组引脚转 AF5 → 改 CPOL/CPHA/分频 → `HAL_SPI_Init()` → `__HAL_SPI_ENABLE()`。**先拉高 CS 再动引脚**，是防止器件状态机错位的关键。
+
+4. **PA15/PB3/PB4 复位后是 JTAG 引脚**，必须在 CubeMX 的 SYS 里把 Debug 选成 **Serial Wire**（不能选 JTAG，也不能选 Trace Asynchronous Sw）。
+
+5. **SPI1 的复用编号是 AF5**（SPI3 才是 AF6）。两组引脚全部用 AF5，写错的现象是"CubeMX 里正常，烧录后一个字节都不响应"。
+
+6. **W25Q64 驱动的三定律**：写之前必须擦（最小擦除单位 4KB 扇区）；每页最多写 256 字节且不能跨页；每条擦/写命令前必须发写使能（`0x06`），之后必须查 BUSY 位等待完成。**漏掉任何一条，芯片会静默丢弃命令。**
+
+7. **TF 卡的初始化是一条完整的状态机**：80 个暖机时钟 → CMD0（`0x95`）进 idle → CMD8（`0x87`）电压协商 → CMD55+ACMD41 循环直到 `R1=0x00` → CMD58 读 OCR 判断寻址方式。**R1 的 bit7 = 0 才表示"有响应"。**
+
+8. **TF 卡读写的三个关键判据**：读用 CMD17、等数据令牌 `0xFE`；写用 CMD24、先发 `0xFE`、数据应答判 `(resp & 0x1F) == 0x05`、最后等 BUSY（MISO 从 `0x00` 回到非 `0x00`）。**"卡忙"表现为 MISO 持续 `0x00`，与"卡没反应"的 `0xFF` 方向相反。**
+
+9. **分层是排错的坐标系**：ID 读不到查"引脚复用层及以下"，能读不能写查"器件层"，交替出错查"总线层的切换逻辑"。**配合串口打点，任何问题都能快速定位到层。**
+
+10. **`bsp_spi1_bus.c` 这一层的价值在于"解耦"**：驱动完全不知道引脚在哪，将来要把 W25Q64 挪到 SPI3，只改总线层一个文件，`bsp_w25q64.c` 一行不动。
+
+---
+
+## 常见问题速查
+
+**表 11-1 全项目故障速查表**
+
+| 现象 | 最可能原因 | 排查步骤 | 解决方案 |
+| --- | --- | --- | --- |
+| CubeMX 里 PB3/PB4/PA15 点不亮 | SYS 的 Debug 选了 JTAG 或 Trace Async Sw | 看 System Core → SYS | 改选 **Serial Wire** |
+| **两组引脚都想配 SPI1，CubeMX 报冲突** | **一个外设只能占一组引脚** | — | **按本项目做分时复用**，PB3~PB5 先配 GPIO |
+| 编译通过但两个器件都不响应 | **AF 写成 AF6** | 打开 `bsp_spi1_bus.c` 看 `GPIO_AF5_SPI1` | SPI1 必须是 **AF5** |
+| **改了 CPOL/分频没生效** | **SPE=1 时 CR1 只读** | 看是否先 `__HAL_SPI_DISABLE()` | 改 CR1 前必须关外设 |
+| FLASH 正常，TF 卡全错 | 切换没切到 TF 侧 | 示波器看 PA5 有无 SCK | 查 `BUS_Select` 的 TF 分支 |
+| 两个器件"同时"有 SCK 波形 | 旧组引脚没转模拟态 | 示波器双通道对比 | 补 `BUS_DetachAnalog()` |
+| 交替读写偶发失败 | 切换时 CS 没先拉高 | 查 `BUS_DeselectAll()` 的位置 | 切换第一步就拉高两路 CS |
+| 反复切换后速度很慢 | 没做"同器件同速度"缓存 | 看 `BUS_Select` 开头的判断 | 加 `s_currentDev` 缓存 |
+| W25Q64 读 ID = `0xFFFFFF` | MISO 悬空/无供电/CS 没拉低 | 量 VCC、MISO、CS | 查焊接与 `BUS_Select` |
+| W25Q64 读 ID = `0xEF4018` | 焊的是 W25Q128 | 看芯片丝印 | 改 `W25Q64_JEDEC_ID` 宏 |
+| W25Q64 读 ID "半对" | CPOL/CPHA 不匹配 | 改总线层 FLASH 分支为模式 0 | 模式 3 ↔ 模式 0 互换 |
+| W25Q64 写不进、读回全 `0xFF` | ① 忘写使能 ② 忘等 BUSY ③ 未擦除 ④ `WP#` 悬空 | 逐条对照 | 补齐四步；`WP#` 上拉 10kΩ |
+| W25Q64 前几字节对、后面错 | 跨页回卷 | 跑跨页测试 | 检查 `pageRemain` 计算 |
+| 程序卡死无输出 | SPI 超时用了 `HAL_MAX_DELAY` | 看 API 的 Timeout 参数 | 改成 100ms |
+| TF 卡 `TF_Check()` 返回 `0xFF` | ① 卡没插好 ② 供电不足 ③ 模式不是 0 ④ 少了 80 时钟 | 先量 VDD=3.3V | 补 80 时钟、确认 CPOL=0/CPHA=1Edge |
+| TF 卡 ACMD41 一直 `0x01` | ① 循环没延时 ② 参数没置 HCS | 看 ACMD41 参数 | 加 `HAL_Delay(10)`；用 `0x40000000` |
+| TF 卡读块等不到 `0xFE` | R1 不是 0x00 就开始等了 | 检查 R1 判断 | **先判 R1，再等令牌** |
+| TF 卡写块"成功"但读回不对 | 数据应答判错 / 没等 BUSY | 看 `(resp & 0x1F) == 0x05` | 补 BUSY 等待 |
+| 写 TF 卡时程序复位 | 电源跌落 | 量写入瞬间 VDD | 加 10µF~100µF 储能电容 |
+| 拔卡后程序死等 | 没有超时机制 | 看每个 while 循环 | 全部加超时并返回错误码 |
+| 重新 GENERATE 后驱动丢失 | 代码写进 CubeMX 管理区 | 看文件位置 | 自写代码放独立文件 |
+
+---
+
+## 附录 A　本项目速查卡
+
+**表 A-1 关键参数速查**
+
+| 项目 | 参数 | 值 |
+| --- | --- | --- |
+| 系统时钟 | SYSCLK / HCLK | 168 MHz |
+| **SPI1 时钟源** | **PCLK2（APB2）** | **84 MHz** |
+| 复用编号 | **SPI1（两组引脚都是）** | **AF5** |
+| FLASH 侧引脚 | CS / SCK / MISO / MOSI | PA15 / PB3 / PB4 / PB5 |
+| TF 卡侧引脚 | CS / SCK / MISO / MOSI | PA4 / PA5 / PA6 / PA7 |
+| FLASH 参数 | 分频 / SCK / 模式 | ÷4 / **21 MHz** / **模式 3**（CPOL=1, CPHA=2Edge） |
+| TF 卡参数 | 分频 / SCK / 模式 | ÷256→**328 kHz**（初始化）、÷4→**21 MHz**（运行）/ **模式 0**（CPOL=0, CPHA=1Edge） |
+| W25Q64 | JEDEC ID / 容量 | **0xEF4017** / 8 MB |
+| W25Q64 | 页 / 扇区 / 块 | 256 B / 4 KB / 64 KB |
+| TF 卡 | 块大小 / 最大 SPI 时钟 | **512 B** / 25 MHz |
+| 关键指令 | 写使能 / 读状态 / 读 / 页写 / 扇区擦 / JEDEC | `0x06` / `0x05` / `0x03` / `0x02` / `0x20` / `0x9F` |
+| TF 卡命令 | CMD0 / CMD8 / CMD55 / ACMD41 / CMD58 / CMD17 / CMD24 | 复位 / 电压协商 / 应用前缀 / 初始化 / 读 OCR / 读块 / 写块 |
+| TF 卡固定字节 | CMD0 CRC / CMD8 CRC / 数据令牌 / 写成功应答 | `0x95` / `0x87` / `0xFE` / `(resp & 0x1F) == 0x05` |
+| 超时建议 | 单字节 / 扇区擦除 / TF 读块 / TF 写块 | 100 ms / 5000 ms / 500 ms / 1000 ms |
+
+---
+
+## 附录 B　文件清单与依赖关系
+
+**表 B-1 本项目自写文件清单**
+
+| 文件 | 行数量级 | 依赖 | 内容 |
+| --- | --- | --- | --- |
+| `bsp_common.h` | ~20 | 无 | 日志宏 `BSP_LOG` |
+| `bsp_spi1_bus.h` | ~70 | `spi.h`、`main.h` | 器件枚举、分频宏、引脚宏、API 声明 |
+| `bsp_spi1_bus.c` | ~190 | `bsp_spi1_bus.h` | AF5 切换、模式切换、字节收发 |
+| `bsp_w25q64.h` | ~110 | `bsp_spi1_bus.h` | 指令宏、容量宏、错误码、API 声明 |
+| `bsp_w25q64.c` | ~380 | `bsp_w25q64.h` | **12 个函数完整实现**（见下表） |
+| `bsp_tfcard.h` | ~90 | `bsp_spi1_bus.h` | 命令宏、`TF_Info_t`、错误码、API 声明 |
+| `bsp_tfcard.c` | ~420 | `bsp_tfcard.h` | **10 个函数完整实现**（见下表） |
+| `app_storage.c` | ~250 | 上述三个驱动 | 测试、压测、自检 |
+
+**表 B-2 bsp_w25q64.c 函数实现清单**
+
+| 函数 | 类型 | 功能 |
+| --- | --- | --- |
+| `W25Q64_SendByte` | static | 单字节收发（透传总线层） |
+| `W25Q64_SendBytes` | static | 连续发送 |
+| `W25Q64_RecvBytes` | static | 连续接收 |
+| `W25Q64_SendAddr` | static | 发送 24 位地址 |
+| `W25Q64_Enter` | static | 切换总线到 FLASH + CS 高 |
+| `W25Q64_ReadStatus` | 公开 | 读状态寄存器 |
+| `W25Q64_WriteEnable` | 公开 | 写使能 `0x06` |
+| `W25Q64_WriteDisable` | 公开 | 写禁止 `0x04` |
+| `W25Q64_WaitForWriteEnd` | 公开 | 忙等待 BUSY 清零 |
+| `W25Q64_ReadID` | 公开 | 读 JEDEC ID `0x9F` |
+| `W25Q64_ReadDeviceID` | 公开 | 读厂商/器件 ID `0x90` |
+| `W25Q64_SectorErase` | 公开 | 擦 4KB 扇区 `0x20` |
+| `W25Q64_BlockErase` | 公开 | 擦 64KB 块 `0xD8` |
+| `W25Q64_ChipErase` | 公开 | 整片擦除 `0xC7` |
+| `W25Q64_PageWrite` | static | 页编程 `0x02`（1~256B） |
+| `W25Q64_WriteBuffer` | 公开 | 任意长度写（按页拆分） |
+| `W25Q64_ReadBuffer` | 公开 | 任意长度读 `0x03` |
+| `W25Q64_EraseAndWrite` | 公开 | 擦扇区 + 写 |
+| `W25Q64_IsBlank` | 公开 | 检查是否全 `0xFF` |
+| `W25Q64_PowerDown` | 公开 | 掉电 `0xB9` |
+| `W25Q64_WakeUp` | 公开 | 唤醒 `0xAB` |
+| `W25Q64_Init` | 公开 | 初始化 + ID 自检 |
+
+**表 B-3 bsp_tfcard.c 函数实现清单**
+
+| 函数 | 类型 | 功能 |
+| --- | --- | --- |
+| `TF_XferByte` | static | 单字节收发 |
+| `TF_SendCmdRaw` | static | 发送 6 字节命令 |
+| `TF_WaitR1` | static | 等待并读取 R1 |
+| `TF_SendCmd` | static | 发命令 + 等 R1（CS 保持低） |
+| `TF_EndTransaction` | static | 拉高 CS + 补时钟 |
+| `TF_PowerOnClock` | static | 80 个暖机时钟 |
+| `TF_Check` | 公开 | 检测卡是否在线 |
+| `TF_Init` | 公开 | 完整初始化（CMD0→CMD8→ACMD41→CMD58） |
+| `TF_EnsureReady` | 公开 | 热插拔自愈 |
+| `TF_ReadBlock` | 公开 | CMD17 读 512 字节 |
+| `TF_WriteBlock` | 公开 | CMD24 写 512 字节 |
+| `TF_ReadBlocks` | 公开 | 多块读（循环） |
+| `TF_WriteBlocks` | 公开 | 多块写（循环） |
+| `TF_GetCapacityMB` | 公开 | 读 CSD 算容量 |
+
+---
+
+> **写在最后**：本笔记的完整代码可以直接贴进 Keil/CubeIDE 编译。**但请务必按"任务五 → 任务七 → 任务九"的顺序验证**——先证明总线层能切，再证明单个器件能跑，最后证明两个器件能交替跑。**这个顺序能让每一层的问题都在它自己的层次里被抓住，而不至于混在一起查三天。**
+
