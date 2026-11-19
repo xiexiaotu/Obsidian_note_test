@@ -1138,4 +1138,2306 @@ SPI_Storage/
 
 ---
 
+## 任务五　SPI1 分时复用总线层（本项目核心）
+
+> **本任务的目标**：写出一个"**让 SPI1 在两组引脚之间安全切换**"的中间层。这一层做对了，后面的 FLASH 与 TF 卡驱动可以**完全不用关心引脚**，只当自己独占一个 SPI1。**这是整个项目技术含量最高、也最容易写错的一层。**
+
+### 环节一　设计总线层的接口
+
+#### 技能点 1　为什么需要独立的一层
+
+##### 知识点 1　三种可选的组织方式
+
+**表 5-1 分时复用代码的三种组织方式**
+
+| 方式 | 做法 | 评价 |
+| --- | --- | --- |
+| A：散落在各驱动里 | 每个驱动的每个函数开头自己写切换代码 | ❌ 重复几十遍，改一处漏十处 |
+| B：用一个全局"当前设备"变量 + 判断 | `if (cur != FLASH) switch_to_flash();` | ⚠️ 能跑，但状态散落、易漏 |
+| **C：独立的 bsp_spi1_bus 层** | **驱动只调 `BUS_Select(dev)`，切换逻辑集中在一处** | ✅ **本项目采用** |
+
+> **方案 C 的好处**：
+> ① **切换逻辑只有一份**，改引脚、改模式、改分频都只动一个文件；
+> ② **驱动层变得和单器件项目一模一样**，野火的代码可以近乎照搬；
+> ③ **可以加"状态缓存"**——如果这次要的器件和上次是同一个，直接跳过切换，省掉 2~5µs。
+
+##### 知识点 2　总线层的 API 设计
+
+**表 5-2 bsp_spi1_bus 对外接口**
+
+| API | 作用 | 谁调用 |
+| --- | --- | --- |
+| `BUS_Init()` | 总线层上电初始化（默认选 TF 卡） | `main()` |
+| `BUS_Select(BUS_DEV_TF)` | 切换到 TF 卡（模式 0，指定分频） | TF 卡驱动入口 |
+| `BUS_Select(BUS_DEV_FLASH)` | 切换到 W25Q64（模式 3，指定分频） | FLASH 驱动入口 |
+| `BUS_ReadWriteByte(b)` | 单字节收发 | 两个驱动 |
+| `BUS_WriteBytes(p, n)` | 连续发送 | 两个驱动 |
+| `BUS_ReadBytes(p, n)` | 连续接收 | 两个驱动 |
+| `BUS_GetCurrent()` | 查询当前接的是谁（调试用） | 测试代码 |
+
+> **设计要点**：`BUS_Select()` 里带上分频参数，是因为 **TF 卡在初始化（328kHz）和工作（21MHz）两个阶段需要不同的速度**，而 FLASH 也可能需要提速。**把"选谁"和"跑多快"合并到一个调用里**，比拆成两个函数更不容易漏。
+
+#### 技能点 2　头文件设计
+
+##### 知识点 1　bsp_spi1_bus.h 完整代码
+
+```c
+/* bsp_spi1_bus.h —— SPI1 分时复用总线层
+ *
+ * 背景：W25Q64（PA15/PB3/PB4/PB5）与 TF 卡（PA4/PA5/PA6/PA7）
+ *       都挂在 SPI1 上（AF5），但一个 SPI 外设同一时刻只能驱动一组引脚。
+ *       本层负责在两组引脚之间安全切换，向上层提供统一的字节读写接口。
+ */
+#ifndef __BSP_SPI1_BUS_H
+#define __BSP_SPI1_BUS_H
+
+#include "main.h"
+#include "spi.h"          /* 提供 hspi1 */
+
+/* ---------- 器件编号 ---------- */
+typedef enum {
+  BUS_DEV_NONE  = 0,
+  BUS_DEV_TF    = 1,      /* TF 卡：PA4/PA5/PA6/PA7，模式 0 */
+  BUS_DEV_FLASH = 2       /* W25Q64：PA15/PB3/PB4/PB5，模式 3 */
+} BUS_DEV;
+
+/* ---------- 分频快捷宏（SPI1 挂 APB2 = 84MHz） ----------
+ *   ÷2   → 42   MHz
+ *   ÷4   → 21   MHz   （工作速率）
+ *   ÷8   → 10.5 MHz
+ *   ÷16  → 5.25 MHz
+ *   ÷32  → 2.625 MHz
+ *   ÷64  → 1.3125 MHz
+ *   ÷128 → 656  kHz
+ *   ÷256 → 328  kHz   （TF 卡初始化必须 ≤400kHz）
+ */
+#define BUS_SPEED_42M    SPI_BAUDRATEPRESCALER_2
+#define BUS_SPEED_21M    SPI_BAUDRATEPRESCALER_4
+#define BUS_SPEED_10M5   SPI_BAUDRATEPRESCALER_8
+#define BUS_SPEED_5M25   SPI_BAUDRATEPRESCALER_16
+#define BUS_SPEED_2M6    SPI_BAUDRATEPRESCALER_32
+#define BUS_SPEED_1M3    SPI_BAUDRATEPRESCALER_64
+#define BUS_SPEED_656K   SPI_BAUDRATEPRESCALER_128
+#define BUS_SPEED_328K   SPI_BAUDRATEPRESCALER_256
+
+/* ---------- 引脚定义（与 CubeMX 中的 User Label 对应） ---------- */
+#define BUS_CS_TF_PIN       GPIO_PIN_4
+#define BUS_CS_TF_PORT      GPIOA
+#define BUS_CS_FLASH_PIN    GPIO_PIN_15
+#define BUS_CS_FLASH_PORT   GPIOA
+
+#define BUS_TF_PINS         (GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7)   /* PA5/6/7 */
+#define BUS_TF_PORT         GPIOA
+#define BUS_FLASH_PINS      (GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5)   /* PB3/4/5 */
+#define BUS_FLASH_PORT      GPIOB
+
+/* ---------- 对外接口 ---------- */
+void     BUS_Init(void);
+void     BUS_Select(BUS_DEV dev, uint32_t prescaler);
+BUS_DEV  BUS_GetCurrent(void);
+void     BUS_DeselectAll(void);
+
+uint8_t  BUS_ReadWriteByte(uint8_t txData);
+void     BUS_WriteBytes(uint8_t *pData, uint16_t len);
+void     BUS_ReadBytes(uint8_t *pData, uint16_t len);
+
+#endif /* __BSP_SPI1_BUS_H */
+```
+
+> **为什么把引脚定义写在这里而不是用 CubeMX 的 User Label**：因为 PB3/PB4/PB5 在 CubeMX 里是"普通 GPIO"，不会有 `SPI1_xxx` 这样的名字。**总线层自己定义一套明确的引脚宏**，比依赖自动生成的宏更好读、更好改。
+
+---
+
+### 环节二　实现总线层的完整代码
+
+#### 技能点 1　核心切换函数
+
+##### 知识点 1　bsp_spi1_bus.c 完整代码
+
+```c
+/* bsp_spi1_bus.c —— SPI1 分时复用总线层实现 */
+#include "bsp_spi1_bus.h"
+
+/* 当前接在 SPI1 上的器件 */
+static BUS_DEV s_currentDev = BUS_DEV_NONE;
+
+/* ---------- 内部：把一组引脚接上 SPI1（AF5） ---------- */
+static void BUS_AttachAF5(GPIO_TypeDef *port, uint16_t pins)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  GPIO_InitStruct.Pin       = pins;
+  GPIO_InitStruct.Mode      = GPIO_MODE_AF_PP;          /* 复用推挽 */
+  GPIO_InitStruct.Pull      = GPIO_NOPULL;
+  GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
+  GPIO_InitStruct.Alternate = GPIO_AF5_SPI1;            /* ★ SPI1 = AF5 */
+  HAL_GPIO_Init(port, &GPIO_InitStruct);
+}
+
+/* ---------- 内部：把一组引脚从 SPI1 上摘下（模拟态隔离） ----------
+ * 模拟态同时断开输出驱动器与输入施密特触发器，
+ * 引脚既不驱动也不感知电平，是"彻底隔离"的标准做法。
+ */
+static void BUS_DetachAnalog(GPIO_TypeDef *port, uint16_t pins)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  GPIO_InitStruct.Pin  = pins;
+  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(port, &GPIO_InitStruct);
+}
+
+/* ---------- 内部：两路片选都拉高（谁都不选中） ---------- */
+void BUS_DeselectAll(void)
+{
+  HAL_GPIO_WritePin(BUS_CS_TF_PORT,    BUS_CS_TF_PIN,    GPIO_PIN_SET);
+  HAL_GPIO_WritePin(BUS_CS_FLASH_PORT, BUS_CS_FLASH_PIN, GPIO_PIN_SET);
+}
+
+/* ---------- 上电初始化 ----------
+ * 把两组引脚都置于"安全态"：片选高、信号线模拟态，
+ * 默认不接任何器件，等第一次 BUS_Select() 再决定。
+ */
+void BUS_Init(void)
+{
+  BUS_DeselectAll();
+
+  /* 两个片选配成推挽输出高（CubeMX 已配，这里再确认一次） */
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  GPIO_InitStruct.Pin   = BUS_CS_TF_PIN | BUS_CS_FLASH_PIN;
+  GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull  = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /* 两组信号线全部摘下 */
+  BUS_DetachAnalog(BUS_TF_PORT,    BUS_TF_PINS);
+  BUS_DetachAnalog(BUS_FLASH_PORT, BUS_FLASH_PINS);
+
+  s_currentDev = BUS_DEV_NONE;
+
+  /* 以 TF 卡身份启动（模式 0、慢速），方便第一次 TF_Init() */
+  BUS_Select(BUS_DEV_TF, BUS_SPEED_328K);
+}
+
+/* ---------- 核心：切换到指定器件 ----------
+ * 顺序严格如下，乱序会导致器件状态机错位：
+ *   ① 关 SPI（SPE=0，才能改 CR1）
+ *   ② 两路 CS 都拉高（先"取消选中"，再动引脚）
+ *   ③ 旧组引脚 → 模拟态（拔掉旧器件）
+ *   ④ 新组引脚 → AF5（接上新器件）
+ *   ⑤ 改 CPOL/CPHA/分频（写入 hspi1.Init）
+ *   ⑥ HAL_SPI_Init()（写进 CR1）
+ *   ⑦ 开 SPI（SPE=1）
+ */
+void BUS_Select(BUS_DEV dev, uint32_t prescaler)
+{
+  /* 同器件且同速度：直接返回，省掉一次切换开销 */
+  static uint32_t s_lastPrescaler = 0;
+  if (dev == s_currentDev && prescaler == s_lastPrescaler)
+  {
+    return;
+  }
+
+  /* ① 关外设 */
+  __HAL_SPI_DISABLE(&hspi1);
+
+  /* ② 两路片选都拉高 */
+  BUS_DeselectAll();
+
+  /* ③④ 引脚切换 */
+  if (dev == BUS_DEV_TF)
+  {
+    BUS_DetachAnalog(BUS_FLASH_PORT, BUS_FLASH_PINS);   /* 拔掉 FLASH */
+    BUS_AttachAF5(BUS_TF_PORT,       BUS_TF_PINS);      /* 接上 TF 卡 */
+    hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;          /* 模式 0 */
+    hspi1.Init.CLKPhase    = SPI_PHASE_1EDGE;
+  }
+  else if (dev == BUS_DEV_FLASH)
+  {
+    BUS_DetachAnalog(BUS_TF_PORT,    BUS_TF_PINS);      /* 拔掉 TF 卡 */
+    BUS_AttachAF5(BUS_FLASH_PORT,    BUS_FLASH_PINS);   /* 接上 FLASH */
+    hspi1.Init.CLKPolarity = SPI_POLARITY_HIGH;         /* 模式 3 */
+    hspi1.Init.CLKPhase    = SPI_PHASE_2EDGE;
+  }
+  else
+  {
+    s_currentDev = BUS_DEV_NONE;
+    return;
+  }
+
+  /* ⑤ 分频 */
+  hspi1.Init.BaudRatePrescaler = prescaler;
+
+  /* ⑥ 重新写入 CR1 */
+  HAL_SPI_Init(&hspi1);
+
+  /* ⑦ 开外设 */
+  __HAL_SPI_ENABLE(&hspi1);
+
+  s_currentDev    = dev;
+  s_lastPrescaler = prescaler;
+}
+
+BUS_DEV BUS_GetCurrent(void)
+{
+  return s_currentDev;
+}
+
+/* ---------- 单字节收发（两个驱动共用的地基） ---------- */
+uint8_t BUS_ReadWriteByte(uint8_t txData)
+{
+  uint8_t rxData = 0xFF;
+  if (HAL_SPI_TransmitReceive(&hspi1, &txData, &rxData, 1, 100) != HAL_OK)
+  {
+    return 0xFF;      /* 超时按"总线沉默"处理，上层据此判错 */
+  }
+  return rxData;
+}
+
+void BUS_WriteBytes(uint8_t *pData, uint16_t len)
+{
+  HAL_SPI_Transmit(&hspi1, pData, len, 1000);
+}
+
+void BUS_ReadBytes(uint8_t *pData, uint16_t len)
+{
+  /* SPI 读必须靠发 dummy 产生时钟，HAL_SPI_Receive 内部自动完成 */
+  HAL_SPI_Receive(&hspi1, pData, len, 1000);
+}
+```
+
+##### 知识点 2　逐行解析关键点
+
+**① 为什么 `HAL_SPI_Init()` 可以反复调用**
+
+`HAL_SPI_Init()` 内部会：
+1. 先调 `__HAL_SPI_DISABLE()`（如果当前是使能的）；
+2. 把 `Init` 结构体的成员逐位写进 `CR1`/`CR2`；
+3. 再根据 `Init` 状态调 `__HAL_SPI_ENABLE()`。
+
+所以它本身就是"关→写→开"的完整流程。我们在外面再手动 `DISABLE`/`ENABLE` 一次，是**双保险**——尤其是某些 HAL 版本在 `SPE=1` 时会跳过部分位的写入。
+
+**② 为什么 `s_lastPrescaler` 要用 `static` 而不是成员变量**
+
+它在函数内部当作"记忆上一次的值"用。用 `static` 局部变量最简单，且**不污染全局命名空间**。但要注意：**它不是线程安全的**（本项目是裸机单线程，没有这个问题）。
+
+**③ 为什么"同器件同速度"要直接 return**
+
+因为切换一次约 2~5µs，而**单字节读写只要 0.4µs**（21MHz）。如果驱动里每个字节都调一次 `BUS_Select()`，切换开销会占掉 90% 的时间。**加了缓存后，连续读写只在第一次真正切换。**
+
+**④ 引脚的"模拟态"到底做了什么**
+
+```
+GPIO_MODE_ANALOG 使能后的引脚内部结构：
+     ┌──────────┐
+     │  输出驱动器 │ ← 断开（高阻）
+     │  ─────────│
+     │  施密特触发器│ ← 断开（不耗电、不感知）
+     └──────────┘
+```
+
+这正是我们想要的"完全消失"。**对比 `GPIO_MODE_INPUT`（浮空）：输入缓冲还在工作，引脚上的噪声会被采进来；`GPIO_MODE_OUTPUT_PP`：驱动器还在使劲输出。**
+
+#### 技能点 2　验证总线层
+
+##### 知识点 1　一个最小验证程序
+
+在写 FLASH 和 TF 卡驱动之前，**先单独验证总线层**——这是稳妥的开发顺序：
+
+```c
+/* 测试：反复切换，看两组引脚是否各自独立 */
+void BUS_SelfTest(void)
+{
+  printf("\r\n===== SPI1 总线层自检 =====\r\n");
+
+  /* 切到 FLASH，读 JEDEC ID */
+  BUS_Select(BUS_DEV_FLASH, BUS_SPEED_21M);
+  HAL_GPIO_WritePin(BUS_CS_FLASH_PORT, BUS_CS_FLASH_PIN, GPIO_PIN_RESET);
+  BUS_ReadWriteByte(0x9F);
+  uint8_t f0 = BUS_ReadWriteByte(0xFF);
+  uint8_t f1 = BUS_ReadWriteByte(0xFF);
+  uint8_t f2 = BUS_ReadWriteByte(0xFF);
+  HAL_GPIO_WritePin(BUS_CS_FLASH_PORT, BUS_CS_FLASH_PIN, GPIO_PIN_SET);
+  printf("[总线] FLASH 位置读到 ID = %02X %02X %02X（期望 EF 40 17）\r\n", f0, f1, f2);
+
+  /* 切到 TF 卡，发 CMD0 看有无响应 */
+  BUS_Select(BUS_DEV_TF, BUS_SPEED_328K);
+  HAL_GPIO_WritePin(BUS_CS_TF_PORT, BUS_CS_TF_PIN, GPIO_PIN_SET);
+  for (int i = 0; i < 10; i++) BUS_ReadWriteByte(0xFF);   /* 80 个暖机时钟 */
+  HAL_GPIO_WritePin(BUS_CS_TF_PORT, BUS_CS_TF_PIN, GPIO_PIN_RESET);
+  BUS_ReadWriteByte(0x40); BUS_ReadWriteByte(0x00);
+  BUS_ReadWriteByte(0x00); BUS_ReadWriteByte(0x00);
+  BUS_ReadWriteByte(0x00); BUS_ReadWriteByte(0x95);
+  uint8_t r1 = 0xFF;
+  for (int i = 0; i < 8 && r1 == 0xFF; i++) r1 = BUS_ReadWriteByte(0xFF);
+  HAL_GPIO_WritePin(BUS_CS_TF_PORT, BUS_CS_TF_PIN, GPIO_PIN_SET);
+  printf("[总线] TF 卡位置读到 R1 = %02X（期望 01）\r\n", r1);
+
+  printf("[总线] 自检完成，当前器件 = %d\r\n", BUS_GetCurrent());
+}
+```
+
+##### 知识点 2　自检结果判读
+
+**表 5-3 总线层自检结果判读**
+
+| FLASH 位置 | TF 卡位置 | 结论 |
+| --- | --- | --- |
+| `EF 40 17` | `01` | ✅ **完美，总线层正确** |
+| `EF 40 17` | `FF` | 总线层对，**TF 卡硬件有问题**（卡座/供电/上拉） |
+| `FF FF FF` | `01` | 总线层对，**FLASH 侧有问题**（PB3/PB4/PB5 未释放 JTAG，或 WP#/HOLD# 悬空） |
+| `FF FF FF` | `FF` | **总线层本身有问题**：先查 `HAL_SPI_MspInit` 的 AF5、再查 `BUS_Select` 有没有被调用 |
+| 两个位置都读到**同样的值** | | **切换没生效**：`BUS_Select` 里引脚没真正改，或两组的 CS 同时使能了 |
+
+> **这张表的价值**：它把"总线层错"和"器件坏"两类完全不同的问题**彻底分开了**。没有这一步，你会把"PB3 是 JTAG 引脚"误判成"FLASH 芯片坏了"，白白换芯片。
+
+##### 知识点 3　用示波器确认切换
+
+用示波器双通道同时看 **PA5（TF 的 SCK）** 和 **PB3（FLASH 的 SCK）**：
+
+- 切到 TF 卡后，**PA5 有波形，PB3 是一条静止的低电平**（模拟态）；
+- 切到 FLASH 后，**PB3 有波形，PA5 静止**；
+- 如果**两个都有波形** → 说明旧组引脚没被摘下，MISO 有冲突风险。
+
+> **"同时只有一个 SCK 活动"是分时复用成功的铁证。**
+
+---
+
+### 环节三　总线层的常见坑
+
+#### 技能点 1　六个易错点
+
+##### 知识点 1　错误清单
+
+**表 5-4 总线层的六个典型错误**
+
+| # | 错误写法 | 后果 | 正确做法 |
+| --- | --- | --- | --- |
+| 1 | 先改引脚，后拉高 CS | 旧器件 CS 还低，SCK 已悬空，状态机错位 | **先 `BUS_DeselectAll()`，再动引脚** |
+| 2 | 忘了 `__HAL_SPI_DISABLE()` | CR1 的 CPOL/CPHA/BR 位写不进去（只读保护） | 改 CR1 前必须 SPE=0 |
+| 3 | 用 `GPIO_MODE_INPUT` 代替模拟态 | 输入缓冲仍在，噪声被采入 | 用 `GPIO_MODE_ANALOG` |
+| 4 | 两组的 CS 都不拉高就切换 | 两个器件同时"半选中"，MISO 打架 | 切换前两路都拉高 |
+| 5 | 每个字节都调 `BUS_Select()` | 切换开销占 90%，速度暴跌十倍 | 用状态缓存 + 只在函数入口切 |
+| 6 | 切换后没给器件留"恢复时间" | 某些批次器件需要几 µs 才进入状态 | 切换后可加 `__NOP()` 数个或 `HAL_Delay(0)` |
+
+##### 知识点 2　关于第 2 条：为什么改不了 CR1
+
+SPI 的 `CR1` 寄存器在 `SPE = 1`（外设使能）状态下，**大部分配置位被硬件锁定**：
+
+| 位 | SPE=0 | SPE=1 |
+| --- | --- | --- |
+| CPOL / CPHA | 可写 | **只读** |
+| BR[2:0] | 可写 | **只读** |
+| DFF / LSBFIRST | 可写 | **只读** |
+| MSTR | 可写 | 可写（有限） |
+
+> **这是"改了分频没生效"的头号原因**：代码没报错，返回值也是 `HAL_OK`，但寄存器根本没变。**只要记住"改 CR1 先关外设"，这类 bug 就绝迹了。**
+
+#### 技能点 2　可选优化：用寄存器直接切换
+
+##### 知识点 1　更快的切换（进阶）
+
+如果项目对切换开销极其敏感（例如高频交替读写），可以绕开 `HAL_SPI_Init()`，**直接操作 GPIO 的 AFR 寄存器**：
+
+```c
+/* 进阶写法：不调用 HAL_GPIO_Init，直接改 AFR（约快 3 倍）
+ * 原理：AFR 每 4 位描述一个引脚的 AF 编号，AF5 = 0b0101
+ *       GPIOA->AFR[0] 管 PA0~PA7，GPIOB->AFR[0] 管 PB0~PB7
+ */
+static void BUS_AttachAF5_Fast(GPIO_TypeDef *port, uint8_t pin)
+{
+  port->AFR[pin >> 3] &= ~(0xFU << ((pin & 0x7U) * 4U));       /* 清 4 位 */
+  port->AFR[pin >> 3] |=  (0x5U << ((pin & 0x7U) * 4U));       /* AF5 */
+  port->MODER &= ~(0x3U << (pin * 2U));                        /* 清模式位 */
+  port->MODER |=  (0x2U << (pin * 2U));                        /* 10 = 复用 */
+}
+
+static void BUS_DetachAnalog_Fast(GPIO_TypeDef *port, uint8_t pin)
+{
+  port->MODER &= ~(0x3U << (pin * 2U));
+  port->MODER |=  (0x3U << (pin * 2U));                        /* 11 = 模拟 */
+}
+```
+
+> **本笔记的主线代码用 `HAL_GPIO_Init()` 版本**，因为它可读性好、不出错；上面这段是**给你在需要极致性能时的参考**。两者功能完全等价。
+>
+> **什么时候才值得优化**：只有当你的业务里"每秒切换上万次"时才有意义。**本项目的实际切换频率是"每次事务一次"，优化收益可以忽略。** 记住一句工程箴言：**先跑通，再优化；过早优化是万恶之源。**
+
+---
+
+## 任务六　W25Q64 驱动开发（完整代码）
+
+> **本任务的目标**：给出**完整、可直接编译**的 `bsp_w25q64.h` 与 `bsp_w25q64.c`。所有函数都实现，不留空。**驱动只依赖任务五的总线层，不直接碰 SPI1 —— 这就是分层的价值。**
+
+### 环节一　认识 W25Q64：指令集与存储特性
+
+#### 技能点 1　建立指令集的概念
+
+##### 知识点 1　为什么 FLASH 需要"指令"而 EEPROM 不需要
+
+对比一下两个器件收发的第一字节：
+
+| 器件 | 第一字节的含义 | 举例 |
+| --- | --- | --- |
+| AT24C02（I2C EEPROM） | **设备地址 + 读写位** | `0xA0` |
+| **W25Q64（SPI FLASH）** | **指令编码（Command Code）** | `0x03` = 读数据 |
+
+**SPI 没有地址寻址机制**，所以 W25Q64 把"第一条要发的字节"全部用来当**操作码**：`0x03` 表示"我要读"，`0x02` 表示"我要写"，`0xD8` 表示"我要擦块"。主机先发操作码，再发参数（地址、数据），芯片据此执行。
+
+> **这就是"指令"二字的由来**：对主机（STM32）来说，它只是按 SPI 协议发出了几个字节；对从机（W25Q64）来说，这几个字节被解释成了**不同含义的操作**。
+
+##### 知识点 2　本项目必须掌握的九条指令
+
+**表 6-1 W25Q64 核心指令表**
+
+| 指令名 | 编码 | 后续字节 | 功能 | 本项目用在哪 |
+| --- | --- | --- | --- | --- |
+| Write Enable | `0x06` | 无 | **写使能**，置位 WEL | 每次擦/写前必发 |
+| Write Disable | `0x04` | 无 | 写禁止，清除 WEL | `W25Q64_PowerDown` 前 |
+| Read Status Register | `0x05` | 回读 S7~S0 | 读状态寄存器（含 BUSY 位） | **忙等待** |
+| Read Data | `0x03` | A23~A0 + 数据流 | 读任意长度数据 | 读数据 |
+| Fast Read | `0x0B` | A23~A0 + 1 dummy + 数据 | 高速读（可到 104MHz） | 提速时用 |
+| Page Program | `0x02` | A23~A0 + 数据（≤256B） | 页编程，写 1~256 字节 | 写数据 |
+| Sector Erase (4KB) | `0x20` | A23~A0 | 擦除 4KB 扇区 | **擦除（主力）** |
+| Block Erase (64KB) | `0xD8` | A23~A0 | 擦除 64KB 块 | 大块擦除 |
+| Chip Erase | `0xC7` | 无 | 整片擦除（约 20s） | `W25Q64_ChipErase()` |
+| **JEDEC ID** | `0x9F` | 回读 3 字节 | 读厂商+容量 ID | **上电自检** |
+
+**表 6-2 常用器件的 JEDEC ID**
+
+| 型号 | 厂商 ID（M7~M0） | 容量 ID（ID15~ID0） | 完整 24 位 ID |
+| --- | --- | --- | --- |
+| **W25Q64** | `0xEF`（Winbond） | `0x4017` | **`0xEF4017`** |
+| W25Q128 | `0xEF` | `0x4018` | `0xEF4018` |
+| W25Q32 | `0xEF` | `0x4016` | `0xEF4016` |
+
+> ⚠️ **陷阱提醒**：野火第 24 章用的是 **W25Q128**，代码里宏定义写的是 `#define sFLASH_ID 0XEF4018`。**本项目是 W25Q64，必须改成 `0xEF4017`**。照抄野火代码却忘了改这一行，是"读 ID 校验失败"最常见的原因——**芯片明明是好的，只是你把 128 的 ID 拿去比 64 的芯片**。
+
+#### 技能点 2　理解 NOR FLASH 的"擦写三定律"
+
+##### 知识点 1　只能 1→0，不能 0→1
+
+> **NOR FLASH 的每一个存储位，编程（写）只能把它从 `1` 变成 `0`；要从 `0` 变回 `1`，必须靠"擦除"这一整块操作。**
+
+由此推出三条工程定律：
+
+1. **写之前必须先擦**：如果目标位置本来是 `0x00`，你想写 `0xFF`，直接写是办不到的；
+2. **擦除以扇区为单位**：最小擦除单位是 4KB。**哪怕只想改 1 个字节，也要擦掉整个 4KB 扇区**；
+3. **擦完之后整块变 `0xFF`**：新擦过的扇区读出来全是 `0xFF`（这是"空"的标志）。
+
+```
+写入流程：  擦除扇区(全变0xFF) → 页编程(把需要的位改成0) → 读回校验
+              4KB                    256B/次
+```
+
+##### 知识点 2　擦除与编程的耗时
+
+**表 6-3 W25Q64 典型操作耗时**
+
+| 操作 | 典型时间 | 最大时间 | 影响 |
+| --- | --- | --- | --- |
+| 页编程（256B） | 0.7 ms | 3 ms | 写 1KB 约 3ms |
+| 扇区擦除（4KB） | 45 ms | 400 ms | **写之前必擦，这笔开销躲不掉** |
+| 块擦除（64KB） | 0.15 s | 2 s | 大批量时用 |
+| 整片擦除 | 20 s | 100 s | 首次使用可整片擦 |
+
+> **由此得出一个重要的设计原则**：**不要"改一个字节就擦一次扇区"**。如果每秒都要改一个配置字节，一秒擦一次 4KB 扇区，芯片寿命（约 10 万次擦写）只能撑 27 小时。
+
+---
+
+### 环节二　bsp_w25q64.h：接口与宏定义
+
+#### 技能点 1　完整头文件
+
+##### 知识点 1　bsp_w25q64.h 完整代码
+
+```c
+/* bsp_w25q64.h —— W25Q64（8MB SPI NOR FLASH）驱动接口
+ *
+ * 依赖：bsp_spi1_bus.h（SPI1 分时复用总线层）
+ * 引脚：CS = PA15，SCK = PB3，MISO = PB4，MOSI = PB5（全部 AF5）
+ *
+ * 使用约定：
+ *   1. 所有公开函数内部会自动 BUS_Select(BUS_DEV_FLASH)，无需调用者手动切换；
+ *   2. 写入前必须先擦除（W25Q64_SectorErase 或 W25Q64_ChipErase）；
+ *   3. 每个公开函数内部已经处理了 CS 的拉低/拉高，调用者不要自己动 CS。
+ */
+#ifndef __BSP_W25Q64_H
+#define __BSP_W25Q64_H
+
+#include "main.h"
+#include "bsp_spi1_bus.h"
+
+/* ==================== 容量与组织参数 ==================== */
+#define W25Q64_FLASH_SIZE        (8UL * 1024UL * 1024UL)   /* 8MB = 8388608 字节 */
+#define W25Q64_SECTOR_SIZE       4096UL                    /* 扇区 4KB，擦除最小单位 */
+#define W25Q64_PAGE_SIZE         256UL                     /* 页 256B，写入最大单位 */
+#define W25Q64_BLOCK_SIZE        65536UL                   /* 块 64KB（16 个扇区） */
+#define W25Q64_SECTOR_COUNT      (W25Q64_FLASH_SIZE / W25Q64_SECTOR_SIZE)  /* 2048 */
+#define W25Q64_PAGE_COUNT        (W25Q64_FLASH_SIZE / W25Q64_PAGE_SIZE)    /* 32768 */
+
+/* ==================== 指令编码 ==================== */
+#define W25X_WriteEnable         0x06
+#define W25X_WriteDisable        0x04
+#define W25X_ReadStatusReg       0x05
+#define W25X_WriteStatusReg      0x01
+#define W25X_ReadData            0x03
+#define W25X_FastReadData        0x0B
+#define W25X_FastReadDual        0x3B
+#define W25X_PageProgram         0x02
+#define W25X_BlockErase          0xD8
+#define W25X_SectorErase         0x20
+#define W25X_ChipErase           0xC7
+#define W25X_PowerDown           0xB9
+#define W25X_ReleasePowerDown    0xAB
+#define W25X_DeviceID            0xAB
+#define W25X_ManufactDeviceID    0x90
+#define W25X_JedecDeviceID       0x9F
+
+/* ==================== 其它常量 ==================== */
+#define W25Q64_JEDEC_ID          0xEF4017UL   /* ★ W25Q64 是 4017，不是 4018 */
+#define W25Q64_DUMMY_BYTE        0xFF
+#define W25Q64_WIP_FLAG          0x01         /* 状态寄存器 bit0 = BUSY */
+#define W25Q64_WEL_FLAG          0x02         /* 状态寄存器 bit1 = 写使能锁存 */
+#define W25Q64_TIMEOUT           1000         /* 单次 SPI 操作超时 ms */
+#define W25Q64_ERASE_TIMEOUT     5000         /* 擦除/编程等待超时 ms（扇区擦最大 400ms，留足余量） */
+
+/* ==================== 返回码 ==================== */
+#define W25Q64_OK                0
+#define W25Q64_ERR_PARAM        (-1)   /* 参数错误（越界/空指针） */
+#define W25Q64_ERR_TIMEOUT      (-2)   /* 忙等待超时 */
+#define W25Q64_ERR_ID           (-3)   /* JEDEC ID 不匹配 */
+#define W25Q64_ERR_BUS          (-4)   /* 总线无响应 */
+
+/* ==================== 片选宏（只在本驱动内部使用） ==================== */
+#define W25Q64_CS_LOW()   HAL_GPIO_WritePin(BUS_CS_FLASH_PORT, BUS_CS_FLASH_PIN, GPIO_PIN_RESET)
+#define W25Q64_CS_HIGH()  HAL_GPIO_WritePin(BUS_CS_FLASH_PORT, BUS_CS_FLASH_PIN, GPIO_PIN_SET)
+
+/* ==================== 对外接口 ==================== */
+
+/* --- 初始化与自检 --- */
+int      W25Q64_Init(void);                 /* 初始化 + 读 ID 自检，返回 W25Q64_OK / W25Q64_ERR_ID */
+uint32_t W25Q64_ReadID(void);               /* 读 JEDEC ID（24 位） */
+uint16_t W25Q64_ReadDeviceID(void);         /* 读厂商+器件 ID（16 位） */
+
+/* --- 状态与使能 --- */
+uint8_t  W25Q64_ReadStatus(void);           /* 读状态寄存器（8 位） */
+void     W25Q64_WriteEnable(void);          /* 写使能（0x06） */
+void     W25Q64_WriteDisable(void);         /* 写禁止（0x04） */
+int      W25Q64_WaitForWriteEnd(void);      /* 等待 BUSY 清零，返回 W25Q64_OK / W25Q64_ERR_TIMEOUT */
+
+/* --- 擦除 --- */
+int      W25Q64_SectorErase(uint32_t sectorAddr);   /* 擦 4KB 扇区，地址自动按 4KB 对齐 */
+int      W25Q64_BlockErase(uint32_t blockAddr);     /* 擦 64KB 块，地址自动按 64KB 对齐 */
+int      W25Q64_ChipErase(void);                    /* 整片擦除（约 20s） */
+
+/* --- 读写 --- */
+int      W25Q64_WriteBuffer(uint32_t addr, uint8_t *pData, uint32_t len);  /* 任意长度写，自动按页拆分 */
+int      W25Q64_ReadBuffer(uint32_t addr, uint8_t *pData, uint32_t len);   /* 任意长度读 */
+
+/* --- 便捷函数 --- */
+int      W25Q64_EraseAndWrite(uint32_t addr, uint8_t *pData, uint32_t len); /* 擦整个扇区再写 */
+int      W25Q64_IsBlank(uint32_t addr, uint32_t len);   /* 检查区域是否为全 0xFF（1=空白） */
+void     W25Q64_PowerDown(void);                        /* 进入掉电模式 */
+void     W25Q64_WakeUp(void);                           /* 唤醒 */
+
+#endif /* __BSP_W25Q64_H */
+```
+
+> **注意返回码的设计**：所有可能失败的函数都返回 `int`，并且区分了四种错误。**这比"返回 void、出错自己想办法"要可靠得多**——上层可以 `if (ret != W25Q64_OK)` 直接判断，也可以 `switch` 出具体原因。
+
+##### 知识点 2　为什么 CS 宏定义在头文件里
+
+`W25Q64_CS_LOW()` / `W25Q64_CS_HIGH()` 在驱动里出现几十次，写成宏既省事又统一；**将来换引脚，只改总线层头文件里的 `BUS_CS_FLASH_PIN` 一处**。
+
+---
+
+### 环节三　bsp_w25q64.c：完整实现（上）
+
+#### 技能点 1　底层收发与地址
+
+##### 知识点 1　内部静态函数
+
+```c
+/* bsp_w25q64.c —— W25Q64 驱动实现
+ *
+ * 所有公开函数都在入口处调用 BUS_Select() 切换到 FLASH，
+ * 内部不直接操作 SPI1 的寄存器，也不关心引脚。
+ *
+ * ★ AF5 说明：PB3/PB4/PB5 的复用切换由总线层完成。
+ */
+#include "bsp_w25q64.h"
+#include <string.h>
+#include <stdio.h>
+
+/* ---------- 单字节收发（透传到总线层） ---------- */
+static uint8_t W25Q64_SendByte(uint8_t txData)
+{
+  return BUS_ReadWriteByte(txData);
+}
+
+/* ---------- 连续发送 ---------- */
+static void W25Q64_SendBytes(uint8_t *pData, uint16_t len)
+{
+  BUS_WriteBytes(pData, len);
+}
+
+/* ---------- 连续接收（内部自动发 dummy 产生时钟） ---------- */
+static void W25Q64_RecvBytes(uint8_t *pData, uint16_t len)
+{
+  BUS_ReadBytes(pData, len);
+}
+
+/* ---------- 发送 24 位地址（高字节在前） ---------- */
+static void W25Q64_SendAddr(uint32_t addr)
+{
+  W25Q64_SendByte((addr >> 16) & 0xFF);   /* A23~A16 */
+  W25Q64_SendByte((addr >>  8) & 0xFF);   /* A15~A8  */
+  W25Q64_SendByte( addr        & 0xFF);   /* A7~A0   */
+}
+
+/* ---------- 进入 FLASH 上下文（切换总线 + 拉高 CS 待命） ---------- */
+static void W25Q64_Enter(void)
+{
+  BUS_Select(BUS_DEV_FLASH, BUS_SPEED_21M);
+  W25Q64_CS_HIGH();        /* 确保处于"未选中"状态 */
+}
+```
+
+> **`W25Q64_Enter()` 是这套驱动的"统一入口"**。每个公开函数第一行都调它，**保证了不管上一次总线接的是谁，进来时一定已经切到 FLASH**。这就是分时复用对上层"完全透明"的实现方式。
+
+#### 技能点 2　状态与写使能
+
+##### 知识点 1　状态寄存器与忙等待
+
+```c
+/**
+ * @brief  读状态寄存器（8 位）
+ * @note   bit0 = BUSY(WIP)，bit1 = WEL，其余为块保护位
+ */
+uint8_t W25Q64_ReadStatus(void)
+{
+  uint8_t status;
+
+  W25Q64_Enter();
+  W25Q64_CS_LOW();
+  W25Q64_SendByte(W25X_ReadStatusReg);
+  status = W25Q64_SendByte(W25Q64_DUMMY_BYTE);
+  W25Q64_CS_HIGH();
+
+  return status;
+}
+
+/**
+ * @brief  写使能：置位 WEL 标志
+ * @note   每次擦除/编程前必须调用，因为 WEL 在每次操作结束后自动清零
+ */
+void W25Q64_WriteEnable(void)
+{
+  W25Q64_Enter();
+  W25Q64_CS_LOW();
+  W25Q64_SendByte(W25X_WriteEnable);
+  W25Q64_CS_HIGH();
+}
+
+/**
+ * @brief  写禁止：清除 WEL 标志
+ */
+void W25Q64_WriteDisable(void)
+{
+  W25Q64_Enter();
+  W25Q64_CS_LOW();
+  W25Q64_SendByte(W25X_WriteDisable);
+  W25Q64_CS_HIGH();
+}
+
+/**
+ * @brief  等待 FLASH 内部擦除/编程结束（BUSY 位归零）
+ * @retval W25Q64_OK / W25Q64_ERR_TIMEOUT
+ * @note   整个等待过程 CS 保持低电平：手册规定发出读状态指令后，
+ *         芯片会持续输出最新状态，直到 CS 拉高为止。
+ */
+int W25Q64_WaitForWriteEnd(void)
+{
+  uint32_t tickstart;
+
+  W25Q64_Enter();
+  W25Q64_CS_LOW();
+  W25Q64_SendByte(W25X_ReadStatusReg);
+
+  tickstart = HAL_GetTick();
+  while ((W25Q64_SendByte(W25Q64_DUMMY_BYTE) & W25Q64_WIP_FLAG) != 0)
+  {
+    if ((HAL_GetTick() - tickstart) > W25Q64_ERASE_TIMEOUT)
+    {
+      W25Q64_CS_HIGH();
+      return W25Q64_ERR_TIMEOUT;
+    }
+  }
+
+  W25Q64_CS_HIGH();
+  return W25Q64_OK;
+}
+```
+
+##### 知识点 2　读 ID 的两个版本
+
+```c
+/**
+ * @brief  读 JEDEC ID（0x9F + 3 字节），用于识别芯片型号
+ * @retval 24 位 ID；W25Q64 应为 0xEF4017
+ */
+uint32_t W25Q64_ReadID(void)
+{
+  uint8_t id[3];
+
+  W25Q64_Enter();
+  W25Q64_CS_LOW();
+  W25Q64_SendByte(W25X_JedecDeviceID);          /* 0x9F */
+  id[0] = W25Q64_SendByte(W25Q64_DUMMY_BYTE);   /* 厂商 ID */
+  id[1] = W25Q64_SendByte(W25Q64_DUMMY_BYTE);   /* 容量高字节 */
+  id[2] = W25Q64_SendByte(W25Q64_DUMMY_BYTE);   /* 容量低字节 */
+  W25Q64_CS_HIGH();
+
+  return ((uint32_t)id[0] << 16) | ((uint32_t)id[1] << 8) | id[2];
+}
+
+/**
+ * @brief  读厂商+器件 ID（0x90 + 3 字节 dummy + 1 字节厂商 + 1 字节器件）
+ * @retval 16 位：高字节 = 厂商 ID(0xEF)，低字节 = 器件 ID(0x17)
+ */
+uint16_t W25Q64_ReadDeviceID(void)
+{
+  uint8_t  mf, dev;
+
+  W25Q64_Enter();
+  W25Q64_CS_LOW();
+  W25Q64_SendByte(W25X_ManufactDeviceID);       /* 0x90 */
+  W25Q64_SendByte(0x00);                        /* 3 字节地址（全 0） */
+  W25Q64_SendByte(0x00);
+  W25Q64_SendByte(0x00);
+  mf  = W25Q64_SendByte(W25Q64_DUMMY_BYTE);     /* 厂商 ID */
+  dev = W25Q64_SendByte(W25Q64_DUMMY_BYTE);     /* 器件 ID */
+  W25Q64_CS_HIGH();
+
+  return ((uint16_t)mf << 8) | dev;
+}
+```
+
+> **`0x90` 与 `0x9F` 的差别**：
+> `0x9F`（JEDEC）= 厂商(1) + 容量(2)，共 3 字节，**靠它识别型号**；
+> `0x90`（Manufacturer/Device）= 3 字节 dummy 地址 + 厂商(1) + 器件(1)，**老式用法，信息更少**。本项目**主用 `0x9F`**，`0x90` 保留作为交叉验证。
+
+---
+
+### 环节四　bsp_w25q64.c：完整实现（下）
+
+#### 技能点 1　三种擦除
+
+##### 知识点 1　扇区擦除、块擦除、整片擦除
+
+```c
+/**
+ * @brief  擦除一个 4KB 扇区
+ * @param  sectorAddr: 扇区内任意地址（内部自动向下对齐到 4KB 边界）
+ * @retval W25Q64_OK / W25Q64_ERR_PARAM / W25Q64_ERR_TIMEOUT
+ */
+int W25Q64_SectorErase(uint32_t sectorAddr)
+{
+  if (sectorAddr >= W25Q64_FLASH_SIZE)
+  {
+    return W25Q64_ERR_PARAM;
+  }
+
+  /* 向下对齐到 4KB 边界：0x1234 → 0x1000 */
+  sectorAddr &= ~(W25Q64_SECTOR_SIZE - 1UL);
+
+  W25Q64_Enter();
+  W25Q64_WriteEnable();                 /* ① 写使能 */
+  if (W25Q64_WaitForWriteEnd() != W25Q64_OK) return W25Q64_ERR_TIMEOUT;
+
+  W25Q64_CS_LOW();                      /* ② 指令 + 地址 */
+  W25Q64_SendByte(W25X_SectorErase);
+  W25Q64_SendAddr(sectorAddr);
+  W25Q64_CS_HIGH();                     /* ③ 拉高，芯片开始擦 */
+
+  return W25Q64_WaitForWriteEnd();      /* ④ 等擦完（最长 400ms） */
+}
+
+/**
+ * @brief  擦除一个 64KB 块
+ * @param  blockAddr: 块内任意地址（内部自动向下对齐到 64KB 边界）
+ */
+int W25Q64_BlockErase(uint32_t blockAddr)
+{
+  if (blockAddr >= W25Q64_FLASH_SIZE)
+  {
+    return W25Q64_ERR_PARAM;
+  }
+
+  blockAddr &= ~(W25Q64_BLOCK_SIZE - 1UL);   /* 对齐到 64KB */
+
+  W25Q64_Enter();
+  W25Q64_WriteEnable();
+  if (W25Q64_WaitForWriteEnd() != W25Q64_OK) return W25Q64_ERR_TIMEOUT;
+
+  W25Q64_CS_LOW();
+  W25Q64_SendByte(W25X_BlockErase);
+  W25Q64_SendAddr(blockAddr);
+  W25Q64_CS_HIGH();
+
+  return W25Q64_WaitForWriteEnd();           /* 最长 2s */
+}
+
+/**
+ * @brief  整片擦除（约 20s，最大 100s）
+ * @note   耗时极长，仅在首次使用或需要彻底清空时调用
+ */
+int W25Q64_ChipErase(void)
+{
+  W25Q64_Enter();
+  W25Q64_WriteEnable();
+
+  W25Q64_CS_LOW();
+  W25Q64_SendByte(W25X_ChipErase);
+  W25Q64_CS_HIGH();
+
+  return W25Q64_WaitForWriteEnd();
+}
+```
+
+##### 知识点 2　对齐处理为什么重要
+
+**表 6-4 地址对齐的处理方式**
+
+| 传入地址 | 实际擦除范围 | 说明 |
+| --- | --- | --- |
+| `0x000000` | `0x000000 ~ 0x000FFF` | 已对齐，正常 |
+| `0x000123` | `0x000000 ~ 0x000FFF` | **自动向下对齐**，擦掉整个 0x000 扇区 |
+| `0x001FFF` | `0x001000 ~ 0x001FFF` | 落在扇区末尾，擦的是它所在的那个扇区 |
+| `0x000FFF` 想"只擦 1 字节" | `0x000000 ~ 0x000FFF` | **FLASH 做不到，只能整扇区擦** |
+
+> **`& ~(SIZE - 1)` 是"向下对齐到 SIZE 整数倍"的通用写法**：因为 SIZE 是 2 的幂，`SIZE - 1` 正好是低位全 1 的掩码，取反后低位全 0。
+> 这行代码的作用是**把"擦哪个字节"的语义，变成"擦哪个扇区"**——避免调用者传入非对齐地址时，误以为擦掉了别的区域。
+
+#### 技能点 2　页编程与不定长写入
+
+##### 知识点 1　页编程（内部函数）
+
+```c
+/**
+ * @brief  页编程（内部函数）：向指定地址写入 1~256 字节
+ * @note   调用前必须确保目标区域已擦除（全 0xFF）
+ * @note   不检查页边界，由调用者（WriteBuffer）保证不跨页
+ */
+static int W25Q64_PageWrite(uint32_t addr, uint8_t *pData, uint16_t len)
+{
+  uint16_t i;
+
+  if (len == 0 || len > W25Q64_PAGE_SIZE)
+  {
+    return W25Q64_ERR_PARAM;
+  }
+
+  W25Q64_Enter();
+  W25Q64_WriteEnable();                     /* 写使能 */
+
+  W25Q64_CS_LOW();
+  W25Q64_SendByte(W25X_PageProgram);        /* 0x02 */
+  W25Q64_SendAddr(addr);
+  for (i = 0; i < len; i++)
+  {
+    W25Q64_SendByte(pData[i]);              /* 逐字节发数据，芯片内部地址自增 */
+  }
+  W25Q64_CS_HIGH();
+
+  return W25Q64_WaitForWriteEnd();          /* 等页编程完成（约 0.7ms） */
+}
+```
+
+##### 知识点 2　页边界：跨页会"回卷"
+
+**这是页编程最反直觉的一点**：
+
+> **页编程命令的地址不要求 256 对齐，但写入的字节数一旦越过了 256 字节的页边界，多出来的数据会"回卷"到本页开头，覆盖掉刚写的数据**——而不是自动跳到下一页。
+
+```
+从 0x0000F0 开始写 32 字节（页边界在 0x0000FF）：
+  0x0000F0~0x0000FF  → 16 字节，正常
+  0x000100~0x00010F  → 本应写这里，实际回卷到 0x000000~0x00000F
+                        并把之前写的 0x0000F0~0x0000FF 覆盖掉一部分
+```
+
+##### 知识点 3　不定长写入（自动按页拆分）
+
+```c
+/**
+ * @brief  向 FLASH 写入任意长度数据（自动按页拆分，绝不跨页）
+ * @param  addr: 起始地址
+ * @param  pData: 数据指针
+ * @param  len: 字节数
+ * @retval W25Q64_OK / W25Q64_ERR_PARAM / W25Q64_ERR_TIMEOUT
+ * @note   调用前必须确保目标扇区已擦除！
+ *         如需"擦+写"一步完成，请用 W25Q64_EraseAndWrite()
+ */
+int W25Q64_WriteBuffer(uint32_t addr, uint8_t *pData, uint32_t len)
+{
+  uint32_t pageRemain;
+  int      ret;
+
+  /* 边界与空指针检查 */
+  if (pData == NULL || len == 0)
+  {
+    return W25Q64_ERR_PARAM;
+  }
+  if (addr >= W25Q64_FLASH_SIZE || (addr + len) > W25Q64_FLASH_SIZE)
+  {
+    return W25Q64_ERR_PARAM;
+  }
+
+  while (len > 0)
+  {
+    /* 本页还能写多少字节：当前地址距离本页末尾的剩余空间 */
+    pageRemain = W25Q64_PAGE_SIZE - (addr % W25Q64_PAGE_SIZE);
+    if (pageRemain > len)
+    {
+      pageRemain = len;                      /* 数据不够填满一页 */
+    }
+
+    ret = W25Q64_PageWrite(addr, pData, (uint16_t)pageRemain);
+    if (ret != W25Q64_OK)
+    {
+      return ret;
+    }
+
+    addr  += pageRemain;
+    pData += pageRemain;
+    len   -= pageRemain;
+  }
+
+  return W25Q64_OK;
+}
+```
+
+> **这个 `pageRemain` 的算法是一切"不定长写 FLASH"的通用骨架**：它先算出"当前页还剩多少空间"，写满一页就换下一页，直到数据写完。**EEPROM 的页写（8 字节/页）用的是完全相同的逻辑**，只是页大小不同——**学会一个，通吃一片**。
+
+#### 技能点 3　连续读取与便捷函数
+
+##### 知识点 1　连续读取
+
+```c
+/**
+ * @brief  从 FLASH 连续读取任意长度数据
+ * @note   读操作没有长度限制：只要 CS 保持低，芯片会一直按地址自增输出
+ */
+int W25Q64_ReadBuffer(uint32_t addr, uint8_t *pData, uint32_t len)
+{
+  if (pData == NULL || len == 0)
+  {
+    return W25Q64_ERR_PARAM;
+  }
+  if (addr >= W25Q64_FLASH_SIZE || (addr + len) > W25Q64_FLASH_SIZE)
+  {
+    return W25Q64_ERR_PARAM;
+  }
+
+  W25Q64_Enter();
+  W25Q64_CS_LOW();
+  W25Q64_SendByte(W25X_ReadData);      /* 0x03 */
+  W25Q64_SendAddr(addr);
+  W25Q64_RecvBytes(pData, (uint16_t)len);
+  W25Q64_CS_HIGH();
+
+  return W25Q64_OK;
+}
+```
+
+> **注意 `(uint16_t)len` 的类型转换**：`BUS_ReadBytes()` 的参数是 `uint16_t`，如果一次读超过 65535 字节，会被截断。**本项目的 `ReadBuffer` 限制在 64KB 以内**。若要读更大块，需要改成"分段循环读"或把总线层参数改成 `uint32_t`。
+
+##### 知识点 2　擦写一体化与空白检测
+
+```c
+/**
+ * @brief  擦除目标区域的起始扇区（可能不止一个），再写入数据
+ * @note   会擦掉从 addr 所在扇区开始、覆盖 [addr, addr+len) 的所有扇区！
+ *         这是"写任意长度"的最简用法，代价是可能擦掉同扇区的其它数据。
+ */
+int W25Q64_EraseAndWrite(uint32_t addr, uint8_t *pData, uint32_t len)
+{
+  uint32_t startSector, endSector, sec;
+
+  if (pData == NULL || len == 0)          return W25Q64_ERR_PARAM;
+  if (addr + len > W25Q64_FLASH_SIZE)     return W25Q64_ERR_PARAM;
+
+  startSector = addr / W25Q64_SECTOR_SIZE;
+  endSector   = (addr + len - 1) / W25Q64_SECTOR_SIZE;
+
+  /* 逐个扇区擦除 */
+  for (sec = startSector; sec <= endSector; sec++)
+  {
+    int ret = W25Q64_SectorErase(sec * W25Q64_SECTOR_SIZE);
+    if (ret != W25Q64_OK) return ret;
+  }
+
+  return W25Q64_WriteBuffer(addr, pData, len);
+}
+
+/**
+ * @brief  检查一段区域是否"空白"（全 0xFF）
+ * @retval 1 = 全 0xFF（空白，可直接写），0 = 有数据，-1 = 参数错误
+ */
+int W25Q64_IsBlank(uint32_t addr, uint32_t len)
+{
+  uint8_t  buf[64];
+  uint32_t i, n;
+
+  if (addr + len > W25Q64_FLASH_SIZE) return -1;
+
+  while (len > 0)
+  {
+    n = (len > sizeof(buf)) ? sizeof(buf) : len;
+
+    if (W25Q64_ReadBuffer(addr, buf, n) != W25Q64_OK) return -1;
+
+    for (i = 0; i < n; i++)
+    {
+      if (buf[i] != 0xFF) return 0;      /* 找到非 0xFF，说明有数据 */
+    }
+
+    addr += n;
+    len  -= n;
+  }
+  return 1;
+}
+```
+
+> **`W25Q64_IsBlank()` 的实用价值**：它让你在写入前能判断"这块区域是不是擦干净的"。**如果已经是空白，就可以跳过擦除**——省下一次 45ms 的扇区擦除，也省下一次擦写寿命。
+
+##### 知识点 3　掉电与唤醒
+
+```c
+/**
+ * @brief  进入掉电模式（功耗降到约 1µA）
+ * @note   进入后除了 0xAB 释放命令，其它指令都不响应
+ */
+void W25Q64_PowerDown(void)
+{
+  W25Q64_Enter();
+  W25Q64_CS_LOW();
+  W25Q64_SendByte(W25X_PowerDown);       /* 0xB9 */
+  W25Q64_CS_HIGH();
+  HAL_Delay(1);                          /* tDP = 3µs（最小），给 1ms 富余 */
+}
+
+/**
+ * @brief  从掉电模式唤醒
+ * @note   发 0xAB 后，芯片会回传一个器件 ID 字节，读出即表示已唤醒
+ */
+void W25Q64_WakeUp(void)
+{
+  W25Q64_Enter();
+  W25Q64_CS_LOW();
+  W25Q64_SendByte(W25X_ReleasePowerDown);   /* 0xAB */
+  W25Q64_SendByte(W25Q64_DUMMY_BYTE);       /* dummy（3 或 4 字节视型号，1 字节足够唤醒） */
+  W25Q64_CS_HIGH();
+  HAL_Delay(1);                             /* tRES1 = 3µs */
+}
+```
+
+#### 技能点 4　初始化与自检
+
+##### 知识点 1　W25Q64_Init 完整实现
+
+```c
+/**
+ * @brief  W25Q64 初始化与自检
+ * @retval W25Q64_OK / W25Q64_ERR_ID
+ * @note   内部会通过总线层把 SPI1 切到 FLASH 一侧（AF5 + 模式 3 + 21MHz）
+ */
+int W25Q64_Init(void)
+{
+  uint32_t id;
+
+  BUS_Select(BUS_DEV_FLASH, BUS_SPEED_21M);   /* 切到 FLASH 一侧 */
+  W25Q64_CS_HIGH();
+  HAL_Delay(5);                                /* 上电稳定（tPUW 典型 5ms） */
+
+  id = W25Q64_ReadID();
+  printf("[W25Q64] JEDEC ID = 0x%06lX\r\n", (unsigned long)id);
+
+  if (id == W25Q64_JEDEC_ID)
+  {
+    printf("[W25Q64] 检测到 W25Q64（8MB），自检通过\r\n");
+    return W25Q64_OK;
+  }
+  else if (id == 0xEF4018UL)
+  {
+    printf("[W25Q64] 警告：实际是 W25Q128（16MB），请修改 W25Q64_JEDEC_ID 宏\r\n");
+  }
+  else if (id == 0xFFFFFFUL)
+  {
+    printf("[W25Q64] 错误：ID 全为 0xFF —— MISO 悬空/无供电/CS 未拉低\r\n");
+    printf("         检查：① 3.3V 供电 ② PB4(MISO) 焊接 ③ PB3 是否已释放 JTAG\r\n");
+  }
+  else if (id == 0x000000UL)
+  {
+    printf("[W25Q64] 错误：ID 全为 0x00 —— MISO 短地/数据线接反\r\n");
+  }
+  else
+  {
+    printf("[W25Q64] 错误：ID 不匹配（读到 0x%06lX，期望 0x%06lX）\r\n",
+           (unsigned long)id, (unsigned long)W25Q64_JEDEC_ID);
+    printf("         若"像但不完全像"，多半是 CPOL/CPHA 模式不对\r\n");
+  }
+  return W25Q64_ERR_ID;
+}
+```
+
+##### 知识点 2　ID 校验的诊断表
+
+**表 6-5 读 ID 结果的诊断表**
+
+| 读到值 | 含义 | 下一步 |
+| --- | --- | --- |
+| **`0xEF4017`** | W25Q64，一切正常 | 继续初始化 |
+| `0xEF4018` | 焊的是 **W25Q128** | 改宏定义，或确认板子型号 |
+| `0xFFFFFF` | MISO 一直高（上拉/悬空/芯片没供电） | 量 VCC、查 MISO 焊接 |
+| `0x000000` | MISO 一直低（短路/CS 时序错） | 查 MISO 是否短地、CS 是否真的在拉低 |
+| `0x7Fxxxx` 之类"半对" | **CPOL/CPHA 模式不匹配** | 从模式 3 换模式 0（反之亦然）试 |
+| `0xEF0000` | 后两字节没收到 | 检查 `DataSize` 是否为 8 位 |
+
+> **这张表把"读 ID 失败"这个模糊现象，变成了六种可定位的故障**。**任何 SPI 器件上电的第一件事，就是读 ID 并和手册比对**——它用最小的代价验证了"时钟通不通、MISO 通不通、模式对不对"三件事。
+
+---
+
+## 任务七　W25Q64 联调与验证
+
+> **本任务的目标**：把驱动跑起来，并用**三条验收线**证明它真的能工作。**写的代码"看起来对"和"真的对"之间，隔着一整套测试。**
+
+### 环节一　编写测试程序
+
+#### 技能点 1　三条验收线对应的三个测试
+
+##### 知识点 1　测试用变量与辅助函数
+
+```c
+/* app_storage.c —— FLASH 测试程序 */
+#include "bsp_w25q64.h"
+#include <string.h>
+#include <stdio.h>
+
+#define FLASH_TEST_ADDR     0x000000UL    /* 测试用地址（扇区 0 起始） */
+#define FLASH_TEST_LEN      256UL         /* 一页长度 */
+
+static uint8_t s_txBuf[FLASH_TEST_LEN];
+static uint8_t s_rxBuf[FLASH_TEST_LEN];
+
+/* 构造测试数据：前 128 字节 ASCII，后 128 字节 0x00~0x7F 递增（覆盖 0x00 与 0xFF） */
+static void BuildTestData(void)
+{
+  uint32_t i;
+  for (i = 0; i < 128; i++)
+  {
+    s_txBuf[i] = (uint8_t)('A' + (i % 26));
+  }
+  for (i = 128; i < FLASH_TEST_LEN; i++)
+  {
+    s_txBuf[i] = (uint8_t)(i - 128);
+  }
+}
+
+/* 逐字节比对，返回 0 表示一致 */
+static int BufferCompare(uint8_t *a, uint8_t *b, uint32_t len)
+{
+  uint32_t i;
+  for (i = 0; i < len; i++)
+  {
+    if (a[i] != b[i])
+    {
+      printf("[校验失败] 第 %lu 字节：写入 0x%02X，读出 0x%02X\r\n",
+             (unsigned long)i, a[i], b[i]);
+      return -1;
+    }
+  }
+  return 0;
+}
+```
+
+##### 知识点 2　测试一 + 测试二：通得上、写得进读得出
+
+```c
+/**
+ * @brief  W25Q64 读写回环测试（测试一 + 测试二）
+ */
+void W25Q64_Test(void)
+{
+  int ret;
+
+  printf("\r\n========== W25Q64 读写测试 ==========\r\n");
+
+  BuildTestData();
+
+  /* ---------- 测试二之前：先看目标扇区是不是已经空白 ---------- */
+  if (W25Q64_IsBlank(FLASH_TEST_ADDR, FLASH_TEST_LEN) == 1)
+  {
+    printf("[测试] 目标区域已是空白，跳过擦除（省 45ms）\r\n");
+  }
+  else
+  {
+    printf("[测试] 正在擦除扇区 0（约 45ms）...\r\n");
+    ret = W25Q64_SectorErase(FLASH_TEST_ADDR);
+    if (ret != W25Q64_OK)
+    {
+      printf("[测试] 擦除失败，ret = %d\r\n", ret);
+      return;
+    }
+  }
+
+  /* ---------- 写入 ---------- */
+  ret = W25Q64_WriteBuffer(FLASH_TEST_ADDR, s_txBuf, FLASH_TEST_LEN);
+  if (ret != W25Q64_OK)
+  {
+    printf("[测试] 写入失败，ret = %d\r\n", ret);
+    return;
+  }
+  printf("[测试] 写入 %lu 字节完成\r\n", (unsigned long)FLASH_TEST_LEN);
+
+  /* ---------- 读回（先清零，防止"读到旧值也算对"） ---------- */
+  memset(s_rxBuf, 0, sizeof(s_rxBuf));
+  ret = W25Q64_ReadBuffer(FLASH_TEST_ADDR, s_rxBuf, FLASH_TEST_LEN);
+  if (ret != W25Q64_OK)
+  {
+    printf("[测试] 读取失败，ret = %d\r\n", ret);
+    return;
+  }
+
+  /* ---------- 比对 ---------- */
+  if (BufferCompare(s_txBuf, s_rxBuf, FLASH_TEST_LEN) == 0)
+  {
+    printf("★ 回环校验通过：写入与读出完全一致\r\n");
+    printf("  读出前 32 字节：%.32s\r\n", s_rxBuf);
+  }
+  else
+  {
+    printf("✗ 回环校验失败\r\n");
+  }
+}
+```
+
+> **`memset(s_rxBuf, 0, ...)` 这一行的作用**：如果读函数因故没写入任何数据，`s_rxBuf` 里残留的是上一次的内容。**先清零，才能区分"读到了正确的数据"和"根本没读到、只是缓冲区碰巧还是对的"**。这是测试代码的通用纪律。
+
+##### 知识点 3　测试三：掉电保持
+
+```c
+/**
+ * @brief  掉电保持验证（测试三）
+ * @note   必须在"复位后"调用，且【不能擦除、不能写入】
+ *         一旦擦除，就变成了"又写一遍再读"，验证不出数据是否真的留在了芯片里
+ */
+void W25Q64_VerifyAfterReset(void)
+{
+  printf("\r\n========== 掉电保持验证 ==========\r\n");
+  printf("（本次不做擦除、不做写入，只读）\r\n");
+
+  BuildTestData();                         /* 重建期望值（与写入时相同） */
+
+  memset(s_rxBuf, 0, sizeof(s_rxBuf));
+  if (W25Q64_ReadBuffer(FLASH_TEST_ADDR, s_rxBuf, FLASH_TEST_LEN) != W25Q64_OK)
+  {
+    printf("✗ 读取失败\r\n");
+    return;
+  }
+
+  if (BufferCompare(s_txBuf, s_rxBuf, FLASH_TEST_LEN) == 0)
+  {
+    printf("★ 掉电保持验证通过：断电重启后数据完好\r\n");
+  }
+  else
+  {
+    printf("✗ 掉电保持验证失败：数据丢失或被改写\r\n");
+    printf("  常见原因：① 写入后没等 BUSY ② 上电时 WP# 拉低 ③ 写进了 RAM 缓存\r\n");
+  }
+}
+```
+
+> **掉了电还读得对，才说明数据真的落盘了。** 这一步是整个 FLASH 项目里**最有说服力**的验收——它一次就排除了"没擦除""没等待""写在缓存里"三类问题。
+
+#### 技能点 2　进阶测试：跨页与全扇区
+
+##### 知识点 1　跨页写入测试
+
+```c
+/**
+ * @brief  跨页写入测试：从非页对齐地址写 300 字节（会跨 2 个页边界）
+ * @note   专门用来验证 pageRemain 拆分逻辑是否正确
+ */
+void W25Q64_TestCrossPage(void)
+{
+  #define CROSS_ADDR   0x000010UL      /* 从页内偏移 16 开始，必然跨页 */
+  #define CROSS_LEN    300UL           /* 300 > 256，必然跨页 */
+
+  uint8_t tx[CROSS_LEN];
+  uint8_t rx[CROSS_LEN];
+  uint32_t i, ret;
+
+  printf("\r\n===== 跨页写入测试（addr=0x%06lX, len=%lu）=====\r\n",
+         (unsigned long)CROSS_ADDR, (unsigned long)CROSS_LEN);
+
+  for (i = 0; i < CROSS_LEN; i++) tx[i] = (uint8_t)(i * 7 + 3);
+
+  if (W25Q64_IsBlank(0x000000, W25Q64_SECTOR_SIZE) != 1)
+  {
+    W25Q64_SectorErase(0x000000);
+  }
+
+  ret = W25Q64_WriteBuffer(CROSS_ADDR, tx, CROSS_LEN);
+  if (ret != W25Q64_OK) { printf("写入失败 ret=%lu\r\n", (unsigned long)ret); return; }
+
+  memset(rx, 0, sizeof(rx));
+  W25Q64_ReadBuffer(CROSS_ADDR, rx, CROSS_LEN);
+
+  if (memcmp(tx, rx, CROSS_LEN) == 0)
+    printf("★ 跨页写入正确（pageRemain 拆分逻辑有效）\r\n");
+  else
+    printf("✗ 跨页写入失败：检查 W25Q64_WriteBuffer 的 pageRemain 计算\r\n");
+}
+```
+
+> **为什么必须专门测跨页**：`pageRemain` 的算法有三种常见错误写法——① 忘了 `% PAGE_SIZE`；② 用了 `PAGE_SIZE - addr` 而不是 `PAGE_SIZE - (addr % PAGE_SIZE)`；③ 循环里更新了 `addr` 但忘了更新 `pData`/`len`。**这三种错误在"页对齐且长度小于一页"时都不会暴露，只有跨页测试能抓出来。**
+
+##### 知识点 2　写满整扇区测试
+
+```c
+/**
+ * @brief  写满整个 4KB 扇区并校验（验证 16 页连续写入）
+ */
+void W25Q64_TestFullSector(void)
+{
+  static uint8_t tx[W25Q64_SECTOR_SIZE];
+  static uint8_t rx[W25Q64_SECTOR_SIZE];
+  uint32_t i, t0, t1;
+
+  printf("\r\n===== 整扇区写入测试（4KB）=====\r\n");
+
+  for (i = 0; i < W25Q64_SECTOR_SIZE; i++) tx[i] = (uint8_t)(i ^ 0xA5);
+
+  t0 = HAL_GetTick();
+  if (W25Q64_EraseAndWrite(0x001000, tx, W25Q64_SECTOR_SIZE) != W25Q64_OK)
+  {
+    printf("写入失败\r\n");
+    return;
+  }
+  t1 = HAL_GetTick();
+  printf("擦 + 写 4KB 耗时 %lu ms（预期约 48~55ms）\r\n", (unsigned long)(t1 - t0));
+
+  memset(rx, 0, sizeof(rx));
+  W25Q64_ReadBuffer(0x001000, rx, W25Q64_SECTOR_SIZE);
+
+  if (memcmp(tx, rx, W25Q64_SECTOR_SIZE) == 0)
+    printf("★ 整扇区写入校验通过\r\n");
+  else
+    printf("✗ 整扇区写入失败\r\n");
+}
+```
+
+> **耗时是一个极好的"健康指标"**：擦 4KB 约 45ms、写 16 页约 11ms，合计约 **56ms**。如果你测出来只有 1~2ms，说明**擦除根本没执行**（数据是"碰巧"对的）；如果超过 500ms，说明**忙等待在空转**。**学会用时间验证行为，比只看数据对不对更可靠。**
+
+---
+
+### 环节二　下载验证与故障排查
+
+#### 技能点 1　运行结果对照
+
+##### 知识点 1　正常的串口输出
+
+```
+========== SPI 存储项目启动 ==========
+[W25Q64] JEDEC ID = 0xEF4017
+[W25Q64] 检测到 W25Q64（8MB），自检通过
+[总线] 自检完成，当前器件 = 2
+
+========== W25Q64 读写测试 ==========
+[测试] 目标区域已是空白，跳过擦除（省 45ms）
+[测试] 写入 256 字节完成
+★ 回环校验通过：写入与读出完全一致
+  读出前 32 字节：ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEF
+
+===== 跨页写入测试（addr=0x000010, len=300）=====
+★ 跨页写入正确（pageRemain 拆分逻辑有效）
+
+===== 整扇区写入测试（4KB）=====
+擦 + 写 4KB 耗时 53 ms（预期约 48~55ms）
+★ 整扇区写入校验通过
+
+========== 掉电保持验证 ==========
+（本次不做擦除、不做写入，只读）
+★ 掉电保持验证通过：断电重启后数据完好
+```
+
+##### 知识点 2　FLASH 故障速查表
+
+**表 7-1 W25Q64 故障速查**
+
+| 现象 | 最可能原因 | 验证方法 | 处理 |
+| --- | --- | --- | --- |
+| ID 读到 `0xFFFFFF` | MISO 悬空 / 芯片没供电 / CS 没拉低 | 万用表量 MISO、VCC、CS | 查 VCC=3.3V、MISO 焊接、`BUS_Select` 是否切到 FLASH |
+| ID 读到 `0x000000` | MISO 短地 / 数据线接反 | 量 MISO 对地电阻 | 查短路；确认 PB4=DO、PB5=DI 没接反 |
+| ID 读到 `0xEF4018` | 焊接的是 W25Q128 | 看芯片丝印 | 改宏定义 |
+| ID 读到"半对"（如 `0x7F20xx`） | **CPOL/CPHA 不匹配** | 改总线层 FLASH 分支为模式 0 | 模式 3 ↔ 模式 0 互换 |
+| **ID 正常但写不进去** | ① 忘写使能 ② 忘等 BUSY ③ 未擦除 ④ `WP#` 悬空 | 在 `PageWrite` 里打点 | 四条逐一排查 |
+| 写入后读回全是 `0xFF` | ① `WP#` 悬空写保护 ② 未擦除 ③ 写使能漏发 | 量 WP# 是否 3.3V | WP# 上拉 10kΩ |
+| 读回数据"整体错位几位" | 模式不匹配 / 速率过高 | 降到 1MHz 试 | 降速或改模式 |
+| 前几字节对、后面全错 | 跨页回卷 | 跑 `W25Q64_TestCrossPage()` | 检查 `pageRemain` 计算 |
+| 第 0 扇区能写、其它扇区不行 | 地址计算错 | 打印实际发送的 3 字节地址 | 核对高低位顺序 |
+| 程序卡死无输出 | SPI 超时用了 `HAL_MAX_DELAY` | — | 改用 100ms 超时 |
+| **FLASH 正常但 TF 卡不正常** | 总线切换没生效 | 看示波器：切到 TF 后 PA5 有无波形 | 检查 `BUS_Select` 的引脚切换分支 |
+| **两器件都异常** | AF 写成 AF6 | 打开 `bsp_spi1_bus.c` 看 `GPIO_AF5_SPI1` | SPI1 必须是 AF5 |
+
+#### 技能点 2　用示波器与 GPIO 打点
+
+##### 知识点 1　四个必须看的位置
+
+1. **CS（PA15）**：每次命令是否是"一次干净的低-高"？
+2. **SCK（PB3）**：空闲时是否是**高电平**（模式 3 的标志）？有无 8 个完整周期的突发？
+3. **MOSI（PB5）**：第一个字节是否是 `0x9F`（读 ID 时）？MSB 是否在前？
+4. **MISO（PB4）**：是否有数据随 SCK 变化（而不是一根直线）？
+
+> **看什么不重要，"这四条同时在一个屏幕上"最重要**。一次典型的"读 ID"应该看到：CS 下降 → SCK 出 8 个周期（0x9F）→ 再出 24 个周期（3 个 ID 字节）→ CS 上升。
+
+##### 知识点 2　用 GPIO 打点测时序
+
+```c
+/* 用一根空闲引脚（比如 PE0）标记代码执行段，示波器量高电平宽度 = 该段耗时 */
+HAL_GPIO_WritePin(GPIOE, GPIO_PIN_0, GPIO_PIN_SET);
+W25Q64_SectorErase(0);
+HAL_GPIO_WritePin(GPIOE, GPIO_PIN_0, GPIO_PIN_RESET);
+/* 量到的高电平宽度应该 ≈ 45ms（扇区擦除典型值） */
+```
+
+> 这招叫"**软件打点**"，比 printf 精确得多（printf 本身就有毫秒级开销），是排查"到底慢在哪"的利器。**也可以用它量 `BUS_Select()` 的切换开销**，验证是否真在 2~5µs 量级。
+
+---
+
+## 任务八　TF 卡（microSD）SPI 模式驱动（完整代码）
+
+> **本任务的目标**：让 TF 卡在 SPI 模式下跑通，并给出**完整可编译**的 `bsp_tfcard.h` / `bsp_tfcard.c`。**这比 W25Q64 难一个数量级**——因为 TF 卡是"一个带 CPU 的小系统"，有自己的一套协议、状态机和应答格式。
+
+### 环节一　认识 TF 卡：从 SD 总线到 SPI 模式
+
+#### 技能点 1　理解 SD 总线的"四线三模式"
+
+##### 知识点 1　同一组引脚，三种工作模式
+
+TF 卡的 8 个引脚中，真正用来通信用的是 4 根。**这 4 根线在不同的工作模式下，含义完全不同**：
+
+**表 8-1 SD 总线三种工作模式**
+
+| 引脚（卡侧） | SD 1 位模式 | 4 位模式 | **SPI 模式（本项目）** |
+| --- | --- | --- | --- |
+| 2 脚 DAT3 | DAT3 | DAT3 | **CS（片选）** |
+| 3 脚 CMD | CMD | CMD | **MOSI**（主机→卡） |
+| 6 脚 CLK | CLK | CLK | **SCK** |
+| 8 脚 DAT0 | DAT0 | DAT0 | **MISO**（卡→主机） |
+| 1 脚 DAT2 | DAT2 | DAT2 | 不用 |
+| 4/5/7 脚 | VSS/VDD/VSS | 同左 | 电源与地 |
+
+> **重点理解这一句**：**同一根线上的信号含义由"工作模式"决定，而不是由引脚物理位置决定。** 本项目把 CMD 当 MOSI、把 DAT0 当 MISO、把 DAT3 当 CS——**这三根线的角色被"重命名"了，它们上面跑的协议也换成了 SPI 协议**。
+
+##### 知识点 2　为什么用 SPI 而不是 SDIO
+
+**表 8-2 SPI 模式 vs SDIO 模式**
+
+| 维度 | SPI 模式（本项目） | SDIO 模式 |
+| --- | --- | --- |
+| 引脚数 | 4 根 | 6 根（CLK/CMD/DAT0~3） |
+| 最高速度 | 25 MHz（约 2.5 MB/s） | 50 MHz × 4 位（约 25 MB/s） |
+| 协议复杂度 | **低**，字节流 + R1 应答 | 高，寄存器 + 状态机 + DMA |
+| 硬件要求 | **任意 SPI 外设即可** | 必须有 SDIO 外设 |
+
+**选 SPI 的理由**：`PA4~PA7` 这组线本来就是 SPI1 的引脚，**用 SPI 零成本**；而 F407VET6 的 SDIO 用的是 PC8~PC12 + PD2，引脚完全对不上。
+
+> **SPI 模式还有个好处**：它绕过了 SD 卡复杂的"卡识别、地址分配、CRC"流程，只用几条命令就能读写。**缺点是慢，且只能单块操作（一次 512 字节）。**
+
+#### 技能点 2　掌握 SD 协议的命令与应答格式
+
+##### 知识点 1　CMD 命令：6 字节定长
+
+SD 卡的每条命令固定 **6 字节**：
+
+```
+┌───────┬───────────────────────────┬──────────┐
+│ CMD   │      Argument (32 位)      │  CRC7    │
+│ 1字节 │  （参数，常见为地址/位图）  │ 1 字节    │
+└───────┴───────────────────────────┴──────────┘
+  bit7~6 = 01（传输位），bit5~0 = 命令号 0~63
+```
+
+- 第一字节：`0x40 | cmd_num`。例如 CMD0 → `0x40`，CMD17 → `0x51`；
+- 中间 4 字节：32 位参数，**高位在前**；
+- 最后 1 字节：CRC7 校验 + 结束位。**在 SPI 模式下，除了 `CMD0` 和 `CMD8`，其余命令的 CRC 都可以直接发 `0x01`**。
+
+> **`CMD0` 和 `CMD8` 的 CRC 为什么必须对**：`CMD0` 固定用 `0x95`、`CMD8` 用 `0x87`（参数为 `0x000001AA` 时）。这两个是**唯二必须正确 CRC 的命令**，因为它们在"卡还没进入数据传输模式、CRC 校验仍然生效"的阶段发出。
+
+##### 知识点 2　响应格式：R1 是基础
+
+```
+bit7  bit6  bit5      bit4      bit3     bit2       bit1       bit0
+ 0    参数错  地址错    擦序错     CRC错    非法命令    擦复位     IdleState
+```
+
+- **bit7 = 0 表示"响应有效"**；
+- **bit0（IdleState）= 1 表示卡还在空闲态**；
+- 常见值：`0x01` = 空闲态，`0x00` = 命令成功，`0x04` = 格式化错误，`0x05` = 空闲 + 非法命令。
+
+##### 知识点 3　发完命令要"等一个 0xFF"
+
+> **SD 规范规定**：主机发出命令后，卡**不是立即应答**的，需要最多 8 个字节的延迟才返回响应。
+
+所以必须先"等到有应答"（`bit7 = 0`），再"检查应答内容"。**这两步分开，诊断信息就清晰了**。
+
+##### 知识点 4　两种数据令牌
+
+| 令牌 | 值 | 用于 |
+| --- | --- | --- |
+| 数据起始令牌 | **`0xFE`** | 读块时卡发出 / 写块时主机发出 |
+| 数据应答令牌 | `xxx0 0101` | 写块后卡回，`(resp & 0x1F) == 0x05` 表示成功 |
+
+---
+
+### 环节二　bsp_tfcard.h：接口与宏定义
+
+#### 技能点 1　完整头文件
+
+##### 知识点 1　bsp_tfcard.h 完整代码
+
+```c
+/* bsp_tfcard.h —— TF 卡（microSD）SPI 模式驱动接口
+ *
+ * 依赖：bsp_spi1_bus.h（SPI1 分时复用总线层）
+ * 引脚：CS = PA4，SCK = PA5，MISO = PA6，MOSI = PA7（全部 AF5）
+ *
+ * 使用约定：
+ *   1. 所有公开函数内部会自动 BUS_Select(BUS_DEV_TF)，无需调用者手动切换；
+ *   2. 初始化会自动从 328kHz 切到 21MHz，调用者无需关心速率；
+ *   3. 卡被拔掉后，调用 TF_EnsureReady() 可重新初始化。
+ */
+#ifndef __BSP_TFCARD_H
+#define __BSP_TFCARD_H
+
+#include "main.h"
+#include "bsp_spi1_bus.h"
+
+/* ==================== 块与令牌 ==================== */
+#define TF_BLOCK_SIZE            512UL     /* SD 卡固定块大小 */
+#define TF_DATA_START_TOKEN      0xFE      /* 数据起始令牌 */
+#define TF_DUMMY_BYTE            0xFF
+#define TF_CMD_TIMEOUT_MS        200       /* 单条命令等 R1 的超时 */
+#define TF_READ_TIMEOUT_MS       500       /* 读一块等令牌的超时 */
+#define TF_WRITE_TIMEOUT_MS      1000      /* 写一块等 BUSY 的超时 */
+
+/* ==================== 命令号 ==================== */
+#define TF_CMD0                  0         /* GO_IDLE_STATE   复位到 idle */
+#define TF_CMD8                  8         /* SEND_IF_COND    电压协商 */
+#define TF_CMD9                  9         /* SEND_CSD        读 CSD */
+#define TF_CMD17                 17        /* READ_SINGLE_BLOCK  */
+#define TF_CMD24                 24        /* WRITE_SINGLE_BLOCK */
+#define TF_CMD55                 55        /* APP_CMD         应用命令前缀 */
+#define TF_CMD58                 58        /* READ_OCR        读 OCR */
+#define TF_ACMD41                41        /* SD_SEND_OP_COND 初始化 */
+
+/* ==================== CRC（只有 CMD0/CMD8 需要正确值） ==================== */
+#define TF_CRC_CMD0              0x95
+#define TF_CRC_CMD8              0x87
+#define TF_CRC_IGNORE            0x01      /* 其余命令一律 0x01 */
+
+/* ==================== 返回码 ==================== */
+#define TF_OK                    0
+#define TF_ERR_PARAM            (-1)    /* 参数错误 */
+#define TF_ERR_NO_CARD          (-2)    /* 无卡/卡不响应 CMD0 */
+#define TF_ERR_INIT             (-3)    /* 初始化流程失败 */
+#define TF_ERR_TIMEOUT          (-4)    /* 等 R1 / 令牌 / BUSY 超时 */
+#define TF_ERR_RESPONSE         (-5)    /* R1 或数据应答不符合预期 */
+#define TF_ERR_TOKEN            (-6)    /* 等不到数据令牌 0xFE */
+
+/* ==================== 卡状态（由 TF_Init 填充） ==================== */
+typedef struct {
+  uint8_t  version;        /* 1 = v1.x 老卡，2 = v2.0+ */
+  uint8_t  blockAddr;      /* 0 = 字节寻址(SDSC)，1 = 块寻址(SDHC/SDXC) */
+  uint8_t  inited;         /* 1 = 已初始化成功 */
+  uint32_t capacityMB;     /* 容量（MB），0 表示未获取 */
+} TF_Info_t;
+
+extern TF_Info_t g_tfInfo;
+
+/* ==================== 片选宏（只在本驱动内部使用） ==================== */
+#define TF_CS_LOW()   HAL_GPIO_WritePin(BUS_CS_TF_PORT, BUS_CS_TF_PIN, GPIO_PIN_RESET)
+#define TF_CS_HIGH()  HAL_GPIO_WritePin(BUS_CS_TF_PORT, BUS_CS_TF_PIN, GPIO_PIN_SET)
+
+/* ==================== 对外接口 ==================== */
+
+/* --- 初始化 --- */
+int      TF_Init(void);                    /* 完整初始化（含识别与提速） */
+int      TF_Check(void);                   /* 仅检测卡是否在线（发 CMD0） */
+int      TF_EnsureReady(void);             /* 若未初始化则尝试初始化（热插拔自愈） */
+
+/* --- 单块读写 --- */
+int      TF_ReadBlock(uint32_t blockNum, uint8_t *pBuf);       /* CMD17 */
+int      TF_WriteBlock(uint32_t blockNum, uint8_t *pBuf);      /* CMD24 */
+
+/* --- 多块操作（循环调用单块） --- */
+int      TF_ReadBlocks(uint32_t startBlock, uint8_t *pBuf, uint32_t count);
+int      TF_WriteBlocks(uint32_t startBlock, uint8_t *pBuf, uint32_t count);
+
+/* --- 信息 --- */
+uint32_t TF_GetCapacityMB(void);           /* 读 CSD 算容量（可选） */
+
+#endif /* __BSP_TFCARD_H */
+```
+
+> **为什么把卡状态放进 `TF_Info_t` 结构体而不是几个散落的全局变量**：① 一处定义、一处查看；② 将来加字段不影响已有代码；③ `TF_EnsureReady()` 可以靠 `inited` 字段做状态自愈。
+
+---
+
+### 环节三　bsp_tfcard.c：完整实现（上）
+
+#### 技能点 1　底层命令与响应
+
+##### 知识点 1　文件头与内部辅助函数
+
+```c
+/* bsp_tfcard.c —— TF 卡 SPI 模式驱动实现 */
+#include "bsp_tfcard.h"
+#include <string.h>
+#include <stdio.h>
+
+TF_Info_t g_tfInfo = {0, 0, 0, 0};
+
+/* ---------- 单字节收发（透传到总线层） ---------- */
+static uint8_t TF_XferByte(uint8_t txData)
+{
+  return BUS_ReadWriteByte(txData);
+}
+
+/* ---------- 发送 6 字节命令（不含 CS 控制） ---------- */
+static void TF_SendCmdRaw(uint8_t cmd, uint32_t arg, uint8_t crc)
+{
+  TF_XferByte(0x40 | cmd);                 /* 命令首字节：01xxxxxx */
+  TF_XferByte((arg >> 24) & 0xFF);         /* 参数高字节在前 */
+  TF_XferByte((arg >> 16) & 0xFF);
+  TF_XferByte((arg >>  8) & 0xFF);
+  TF_XferByte( arg        & 0xFF);
+  TF_XferByte(crc);                        /* CRC 或 0x01 */
+}
+
+/* ---------- 等待并读取 R1 响应 ----------
+ * 原理：卡不会立即应答，需要最多 8 字节延迟。
+ *       循环发 0xFF 直到读到 bit7 = 0 的字节；全 0xFF 表示卡没应答。
+ */
+static uint8_t TF_WaitR1(uint32_t timeout_ms)
+{
+  uint8_t  ret = 0xFF;
+  uint32_t tickstart = HAL_GetTick();
+
+  do {
+    ret = TF_XferByte(TF_DUMMY_BYTE);
+    if ((HAL_GetTick() - tickstart) > timeout_ms) return 0xFF;
+  } while (ret == 0xFF);
+
+  return ret;
+}
+
+/* ---------- 发送命令 + 等 R1（CS 保持低，由调用者决定何时拉高） ---------- */
+static uint8_t TF_SendCmd(uint8_t cmd, uint32_t arg, uint8_t crc)
+{
+  /* 发命令前先给一个字节的时钟，让卡完成上一条命令的内部处理 */
+  TF_CS_HIGH();
+  TF_XferByte(TF_DUMMY_BYTE);
+
+  TF_CS_LOW();
+  TF_SendCmdRaw(cmd, arg, crc);
+
+  return TF_WaitR1(TF_CMD_TIMEOUT_MS);
+}
+
+/* ---------- 结束一次事务：拉高 CS，补一个时钟 ---------- */
+static void TF_EndTransaction(void)
+{
+  TF_CS_HIGH();
+  TF_XferByte(TF_DUMMY_BYTE);
+}
+
+/* ---------- 上电 80 个暖机时钟（CS 必须高） ---------- */
+static void TF_PowerOnClock(void)
+{
+  TF_CS_HIGH();
+  for (uint8_t i = 0; i < 10; i++)       /* 10 字节 = 80 个时钟，规范要求 ≥74 */
+  {
+    TF_XferByte(TF_DUMMY_BYTE);
+  }
+}
+```
+
+##### 知识点 2　为什么 CS 由调用者控制
+
+```c
+/* CMD17 的完整事务跨越"命令 + R1 + 数据令牌 + 512 字节数据"，
+   全程 CS 必须保持低。如果 TF_SendCmd() 内部就把 CS 拉高，
+   后面的数据就读不到了。 */
+```
+
+> **这是 SD 卡驱动最容易被写错的结构性问题**：把"发命令"和"结束事务"分开，而不是让 `TF_SendCmd` 一把梭。**记住一句：CS 的生命周期 = 一笔完整事务，而不是一条命令。**
+
+#### 技能点 2　检测与初始化
+
+##### 知识点 1　检测与完整初始化
+
+```c
+/**
+ * @brief  检测 TF 卡是否插入并在线
+ * @retval TF_OK / TF_ERR_NO_CARD
+ * @note   方法：发 CMD0，若卡在，会返回 0x01（idle 态）。
+ *         CMD0 是唯一在任何状态下都会被响应的命令，所以它既是"检测"也是"复位"。
+ */
+int TF_Check(void)
+{
+  uint8_t r1 = 0xFF;
+  uint8_t retry;
+
+  BUS_Select(BUS_DEV_TF, BUS_SPEED_328K);   /* 慢速：≤400kHz */
+  TF_PowerOnClock();
+
+  for (retry = 0; retry < 10; retry++)
+  {
+    r1 = TF_SendCmd(TF_CMD0, 0x00000000, TF_CRC_CMD0);
+    TF_EndTransaction();
+    if (r1 == 0x01) break;
+    HAL_Delay(1);
+  }
+
+  if (r1 == 0x01)
+  {
+    printf("[TF] 检测到卡（CMD0 响应 0x01，空闲态）\r\n");
+    return TF_OK;
+  }
+
+  printf("[TF] 未检测到卡（CMD0 响应 0x%02X）\r\n", r1);
+  return TF_ERR_NO_CARD;
+}
+```
+
+```c
+/**
+ * @brief  TF 卡 SPI 模式完整初始化
+ * @retval TF_OK / 各类错误码
+ * @note   流程：CMD0 → CMD8 → (CMD55+ACMD41 循环) → CMD58，最后提速到 21MHz
+ */
+int TF_Init(void)
+{
+  uint8_t  r1;
+  uint8_t  buf[4];
+  uint32_t retry;
+
+  /* 清零状态 */
+  g_tfInfo.version   = 0;
+  g_tfInfo.blockAddr = 0;
+  g_tfInfo.inited    = 0;
+  g_tfInfo.capacityMB = 0;
+
+  /* ---------- 步骤 0：切到 TF 卡 + 慢速 ---------- */
+  BUS_Select(BUS_DEV_TF, BUS_SPEED_328K);
+  TF_PowerOnClock();
+  HAL_Delay(2);                              /* 给卡上电复位时间 */
+
+  /* ---------- 步骤 1：CMD0 复位到 idle ---------- */
+  for (retry = 0; retry < 20; retry++)
+  {
+    r1 = TF_SendCmd(TF_CMD0, 0x00000000, TF_CRC_CMD0);
+    TF_EndTransaction();
+    if (r1 == 0x01) break;
+    HAL_Delay(1);
+  }
+  if (r1 != 0x01)
+  {
+    printf("[TF] CMD0 失败（R1=0x%02X），卡未响应\r\n", r1);
+    return TF_ERR_NO_CARD;
+  }
+
+  /* ---------- 步骤 2：CMD8 电压协商 ---------- */
+  r1 = TF_SendCmd(TF_CMD8, 0x000001AA, TF_CRC_CMD8);
+  if (r1 == 0x01)
+  {
+    for (int i = 0; i < 4; i++) buf[i] = TF_XferByte(TF_DUMMY_BYTE);
+    TF_EndTransaction();
+
+    if ((buf[2] == 0x01) && (buf[3] == 0xAA))
+    {
+      g_tfInfo.version = 2;
+      printf("[TF] CMD8 响应正常，v2.0 卡\r\n");
+    }
+    else
+    {
+      printf("[TF] CMD8 回显校验失败（收到 %02X %02X）\r\n", buf[2], buf[3]);
+      return TF_ERR_INIT;
+    }
+  }
+  else if (r1 == 0x05)                        /* 非法命令 = v1 老卡 */
+  {
+    TF_EndTransaction();
+    g_tfInfo.version = 1;
+    printf("[TF] CMD8 无响应，按 v1.x 老卡处理\r\n");
+  }
+  else
+  {
+    TF_EndTransaction();
+    printf("[TF] CMD8 异常响应 0x%02X\r\n", r1);
+    return TF_ERR_INIT;
+  }
+
+  /* ---------- 步骤 3：ACMD41 循环，直到 R1 = 0x00 ---------- */
+  for (retry = 0; retry < 200; retry++)
+  {
+    /* 3a. CMD55：告诉卡"下一条是应用命令" */
+    r1 = TF_SendCmd(TF_CMD55, 0x00000000, TF_CRC_IGNORE);
+    TF_EndTransaction();
+    if (r1 > 0x01)
+    {
+      printf("[TF] CMD55 失败（R1=0x%02X）\r\n", r1);
+      return TF_ERR_INIT;
+    }
+
+    /* 3b. ACMD41：bit30 = HCS，置 1 表示主机支持高容量卡 */
+    r1 = TF_SendCmd(TF_ACMD41, 0x40000000, TF_CRC_IGNORE);
+    TF_EndTransaction();
+
+    if (r1 == 0x00) break;                    /* 初始化完成 */
+
+    HAL_Delay(10);                            /* 给卡真实时间完成内部初始化 */
+  }
+  if (r1 != 0x00)
+  {
+    printf("[TF] ACMD41 超时（重试 %lu 次），卡初始化失败\r\n", (unsigned long)retry);
+    return TF_ERR_INIT;
+  }
+
+  /* ---------- 步骤 4：CMD58 读 OCR，判断寻址方式 ---------- */
+  r1 = TF_SendCmd(TF_CMD58, 0x00000000, TF_CRC_IGNORE);
+  if (r1 == 0x00)
+  {
+    for (int i = 0; i < 4; i++) buf[i] = TF_XferByte(TF_DUMMY_BYTE);
+    /* OCR 的 bit30 = CCS：1 = SDHC/SDXC（块寻址），0 = SDSC（字节寻址）
+       buf[0] 是 OCR 最高字节，bit30 落在它的 bit6 上 */
+    g_tfInfo.blockAddr = ((buf[0] & 0x40) != 0) ? 1 : 0;
+
+    if (g_tfInfo.blockAddr)
+      printf("[TF] 高容量卡（SDHC/SDXC），块寻址，单块 512 字节\r\n");
+    else
+      printf("[TF] 标准容量卡（SDSC），字节寻址\r\n");
+  }
+  TF_EndTransaction();
+
+  /* ---------- 步骤 5：提速到 21MHz（识别完成后才能提速） ---------- */
+  BUS_Select(BUS_DEV_TF, BUS_SPEED_21M);
+
+  g_tfInfo.inited = 1;
+  printf("[TF] 初始化成功（%s，%lu MHz SCK）\r\n",
+         g_tfInfo.blockAddr ? "块寻址" : "字节寻址", 21UL);
+  return TF_OK;
+}
+```
+
+##### 知识点 2　三个关键细节
+
+1. **`HAL_Delay(10)` 在 ACMD41 循环里不能省**：卡的内部初始化需要真实时间（几毫秒到几百毫秒）。不停发命令而不给延时，`r1` 永远是 `0x01`；
+2. **ACMD41 的参数 `0x40000000`**：bit30 = HCS（Host Capacity Support），置 1 表示"我支持高容量卡"。**如果卡是 SDHC/SDXC，不置这一位它就不会完成初始化**；
+3. **CMD58 的 bit30 决定地址单位**：SDHC/SDXC 是"**块寻址**"（参数是块号），SDSC 是"**字节寻址**"（参数是字节偏移）。**算错了就读到错误的扇区。**
+
+> **本项目约定**：后面所有的读写都按 **块寻址** 处理。代码里用 `g_tfInfo.blockAddr` 自动判断并换算，**调用者不用关心**。
+
+---
+
+### 环节四　bsp_tfcard.c：完整实现（下）
+
+#### 技能点 1　单块读写
+
+##### 知识点 1　CMD17 读块
+
+```c
+/**
+ * @brief  读取一个 512 字节的数据块
+ * @param  blockNum: 块号（SDHC/SDXC 从 0 开始；SDSC 内部自动换算成字节偏移）
+ * @param  pBuf: 数据缓冲区，必须 ≥512 字节
+ * @retval TF_OK / 错误码
+ */
+int TF_ReadBlock(uint32_t blockNum, uint8_t *pBuf)
+{
+  uint8_t  r1;
+  uint32_t tickstart;
+  uint32_t arg;
+  uint32_t i;
+
+  if (pBuf == NULL) return TF_ERR_PARAM;
+  if (!g_tfInfo.inited) return TF_ERR_INIT;
+
+  /* SDSC 是字节寻址：块号 × 512 = 字节偏移；SDHC/SDXC 直接用块号 */
+  arg = g_tfInfo.blockAddr ? blockNum : (blockNum * TF_BLOCK_SIZE);
+
+  /* ---------- ① 发 CMD17 ---------- */
+  r1 = TF_SendCmd(TF_CMD17, arg, TF_CRC_IGNORE);
+  if (r1 != 0x00)
+  {
+    TF_EndTransaction();
+    printf("[TF] CMD17 失败，R1 = 0x%02X\r\n", r1);
+    return TF_ERR_RESPONSE;
+  }
+
+  /* ---------- ② 等数据起始令牌 0xFE ---------- */
+  tickstart = HAL_GetTick();
+  do {
+    r1 = TF_XferByte(TF_DUMMY_BYTE);
+    if ((HAL_GetTick() - tickstart) > TF_READ_TIMEOUT_MS)
+    {
+      TF_EndTransaction();
+      printf("[TF] 等待数据令牌超时（最后一次读到 0x%02X）\r\n", r1);
+      return TF_ERR_TOKEN;
+    }
+  } while (r1 != TF_DATA_START_TOKEN);
+
+  /* ---------- ③ 读 512 字节数据 ---------- */
+  for (i = 0; i < TF_BLOCK_SIZE; i++)
+  {
+    pBuf[i] = TF_XferByte(TF_DUMMY_BYTE);
+  }
+
+  /* ---------- ④ 读并丢弃 2 字节 CRC ---------- */
+  TF_XferByte(TF_DUMMY_BYTE);
+  TF_XferByte(TF_DUMMY_BYTE);
+
+  /* ---------- ⑤ 结束 ---------- */
+  TF_EndTransaction();
+  return TF_OK;
+}
+```
+
+> **判断顺序**：**先看 R1，再看令牌**。R1 不是 `0x00` 就直接返回，不要傻等 `0xFE`——等不到，因为卡压根没开始准备数据。
+
+##### 知识点 2　CMD24 写块
+
+```c
+/**
+ * @brief  写入一个 512 字节的数据块
+ * @param  blockNum: 块号
+ * @param  pBuf: 待写入数据，长度 512 字节
+ * @retval TF_OK / 错误码
+ */
+int TF_WriteBlock(uint32_t blockNum, uint8_t *pBuf)
+{
+  uint8_t  r1, resp;
+  uint32_t tickstart;
+  uint32_t arg;
+  uint32_t i;
+
+  if (pBuf == NULL) return TF_ERR_PARAM;
+  if (!g_tfInfo.inited) return TF_ERR_INIT;
+
+  arg = g_tfInfo.blockAddr ? blockNum : (blockNum * TF_BLOCK_SIZE);
+
+  /* ---------- ① 发 CMD24 ---------- */
+  r1 = TF_SendCmd(TF_CMD24, arg, TF_CRC_IGNORE);
+  if (r1 != 0x00)
+  {
+    TF_EndTransaction();
+    printf("[TF] CMD24 失败，R1 = 0x%02X\r\n", r1);
+    return TF_ERR_RESPONSE;
+  }
+
+  /* ---------- ② 发送数据起始令牌 + 512 字节 ---------- */
+  TF_XferByte(TF_DATA_START_TOKEN);            /* 0xFE */
+  for (i = 0; i < TF_BLOCK_SIZE; i++)
+  {
+    TF_XferByte(pBuf[i]);
+  }
+  TF_XferByte(TF_DUMMY_BYTE);                  /* CRC 占位 */
+  TF_XferByte(TF_DUMMY_BYTE);
+
+  /* ---------- ③ 读数据应答令牌 ----------
+     格式：xxx0 0101 表示成功，屏蔽高 3 位后应为 0x05 */
+  resp = TF_XferByte(TF_DUMMY_BYTE);
+  if ((resp & 0x1F) != 0x05)
+  {
+    TF_EndTransaction();
+    printf("[TF] 数据应答失败，resp = 0x%02X（期望 bit4~1 = 010）\r\n", resp);
+    return TF_ERR_RESPONSE;
+  }
+
+  /* ---------- ④ 等卡内部编程结束（BUSY 期间 MISO 为 0x00） ---------- */
+  tickstart = HAL_GetTick();
+  do {
+    resp = TF_XferByte(TF_DUMMY_BYTE);
+    if ((HAL_GetTick() - tickstart) > TF_WRITE_TIMEOUT_MS)
+    {
+      TF_EndTransaction();
+      printf("[TF] 写块 BUSY 超时\r\n");
+      return TF_ERR_TIMEOUT;
+    }
+  } while (resp == 0x00);                      /* 还在忙 */
+
+  /* ---------- ⑤ 结束 ---------- */
+  TF_EndTransaction();
+  return TF_OK;
+}
+```
+
+##### 知识点 3　两个"忙"不要混
+
+**表 8-3 三种等待的对比**
+
+| 等待 | 在哪一步 | 现象 | 判断条件 |
+| --- | --- | --- | --- |
+| **等 R1 响应** | 发完命令后 | MISO 一直 `0xFF` | 读到 `bit7 = 0`（即 `!= 0xFF`）即结束 |
+| **等数据令牌** | R1 成功后 | MISO 一直 `0xFF` | 读到 `0xFE` |
+| **等 BUSY（写入）** | 数据应答后 | MISO 一直 `0x00` | 读到 `!= 0x00`（通常为 `0xFF`） |
+
+> **注意最后一种的判断方向与前两种相反**：前两种是"**等一个不等于 0xFF 的值**"，最后一种是"**等一个不等于 0x00 的值**"。**"卡忙"在 SD 协议里表现为 MISO 持续输出 0x00**，这是它和"卡没反应（0xFF）"的相反之处——**如果搞混，写块会立刻返回"成功"，但数据其实没写进去。**
+
+#### 技能点 2　多块操作与自愈
+
+##### 知识点 1　多块读写（循环单块）
+
+```c
+/**
+ * @brief  连续读多个块（内部循环调用 TF_ReadBlock）
+ * @note   单块命令的吞吐率低于 CMD18 多块读，但实现简单、容错好
+ */
+int TF_ReadBlocks(uint32_t startBlock, uint8_t *pBuf, uint32_t count)
+{
+  uint32_t i;
+  int      ret;
+
+  if (pBuf == NULL || count == 0) return TF_ERR_PARAM;
+
+  for (i = 0; i < count; i++)
+  {
+    ret = TF_ReadBlock(startBlock + i, pBuf + i * TF_BLOCK_SIZE);
+    if (ret != TF_OK) return ret;
+  }
+  return TF_OK;
+}
+
+/**
+ * @brief  连续写多个块
+ */
+int TF_WriteBlocks(uint32_t startBlock, uint8_t *pBuf, uint32_t count)
+{
+  uint32_t i;
+  int      ret;
+
+  if (pBuf == NULL || count == 0) return TF_ERR_PARAM;
+
+  for (i = 0; i < count; i++)
+  {
+    ret = TF_WriteBlock(startBlock + i, pBuf + i * TF_BLOCK_SIZE);
+    if (ret != TF_OK) return ret;
+  }
+  return TF_OK;
+}
+```
+
+> **为什么不用 CMD18/CMD25（多块读写）**：多块命令需要处理 CMD12（停止传输）和卡自动递增的细节，**出错后更难恢复**。本项目的数据量小、对吞吐率要求不高，**循环单块是更稳妥的工程选择**。要做大数据量时再升级。
+
+##### 知识点 2　热插拔自愈
+
+```c
+/**
+ * @brief  确保卡就绪：未初始化则尝试初始化一次
+ * @retval TF_OK / 错误码
+ * @note   典型用法：每次上层操作前调一次，卡被拔掉再插回来能自动恢复
+ */
+int TF_EnsureReady(void)
+{
+  if (g_tfInfo.inited)
+  {
+    return TF_OK;
+  }
+  return TF_Init();
+}
+```
+
+> **这类"状态自愈"的设计**，是把一个"能跑的 demo"变成"能用的产品"的关键一步。**嵌入式设备的部署环境千变万化，能自己恢复的程序才叫可靠。**
+
+##### 知识点 3　读 CSD 获取容量（可选）
+
+```c
+/**
+ * @brief  读取并解析 TF 卡容量（仅针对 SDHC/SDXC）
+ * @retval 容量（MB）；失败返回 0
+ * @note   CSD 位域在不同版本卡上不同，实际工程多用文件系统读取，
+ *         本函数用于"知道容量从哪来"的教学目的
+ */
+uint32_t TF_GetCapacityMB(void)
+{
+  uint8_t  r1, csd[16];
+  uint32_t c_size, tickstart;
+
+  if (!g_tfInfo.inited) return 0;
+
+  r1 = TF_SendCmd(TF_CMD9, 0x00000000, TF_CRC_IGNORE);   /* CMD9 = SEND_CSD */
+  if (r1 != 0x00)
+  {
+    TF_EndTransaction();
+    return 0;
+  }
+
+  /* 等数据令牌 */
+  tickstart = HAL_GetTick();
+  do {
+    r1 = TF_XferByte(TF_DUMMY_BYTE);
+    if ((HAL_GetTick() - tickstart) > TF_READ_TIMEOUT_MS)
+    {
+      TF_EndTransaction();
+      return 0;
+    }
+  } while (r1 != TF_DATA_START_TOKEN);
+
+  for (int i = 0; i < 16; i++) csd[i] = TF_XferByte(TF_DUMMY_BYTE);
+  TF_XferByte(TF_DUMMY_BYTE);        /* CRC */
+  TF_XferByte(TF_DUMMY_BYTE);
+  TF_EndTransaction();
+
+  /* CSD 的 C_SIZE（22 位）位于 bit 69~48，在 16 字节数组中的位置如下 */
+  c_size = ((uint32_t)(csd[7] & 0x3F) << 16)
+         | ((uint32_t)csd[8] << 8)
+         |  (uint32_t)csd[9];
+
+  /* SDHC/SDXC：容量 = (C_SIZE + 1) × 512KB */
+  g_tfInfo.capacityMB = (c_size + 1) * 512UL / 1024UL;
+  printf("[TF] 容量 = %lu MB\r\n", (unsigned long)g_tfInfo.capacityMB);
+  return g_tfInfo.capacityMB;
+}
+```
+
+---
+
+### 环节五　TF 卡测试与验证
+
+#### 技能点 1　回环测试
+
+##### 知识点 1　选一个"安全"的测试块
+
+**千万不要对块 0 做写测试**——那是分区表/引导扇区，写坏了卡就"变砖"（需要重新格式化）。
+
+```c
+#define TF_TEST_BLOCK   2048      /* 保守起见用块 2048（约 1MB 位置） */
+```
+
+**为什么选靠后的块**：即使那块区域有文件系统数据，写坏了顶多丢文件，**不会破坏分区表**。测试前最好用读操作看一眼目标块的内容——**若全是 `0x00` 或 `0xFF`，大概率是空闲区。**
+
+##### 知识点 2　完整测试流程
+
+```c
+void TF_Test(void)
+{
+  static uint8_t tx[TF_BLOCK_SIZE];
+  static uint8_t rx[TF_BLOCK_SIZE];
+  uint32_t i;
+
+  printf("\r\n========== TF 卡读写测试 ==========\r\n");
+
+  /* ---------- ① 先读一次目标块，看看原来是什么 ---------- */
+  if (TF_ReadBlock(TF_TEST_BLOCK, rx) != TF_OK)
+  {
+    printf("[TF] 预读失败，测试中止\r\n");
+    return;
+  }
+  printf("[TF] 块 %lu 预读成功，首字节 0x%02X\r\n",
+         (unsigned long)TF_TEST_BLOCK, rx[0]);
+
+  /* ---------- ② 构造测试数据 ---------- */
+  for (i = 0; i < TF_BLOCK_SIZE; i++)
+  {
+    tx[i] = (uint8_t)(i & 0xFF);
+  }
+  memcpy(tx, "TF-CARD SPI TEST OK!", 20);       /* 前 20 字节盖可读文本 */
+
+  /* ---------- ③ 写入 ---------- */
+  if (TF_WriteBlock(TF_TEST_BLOCK, tx) != TF_OK)
+  {
+    printf("[TF] 写块失败\r\n");
+    return;
+  }
+  printf("[TF] 写入 512 字节完成\r\n");
+
+  /* ---------- ④ 读回并比对 ---------- */
+  memset(rx, 0, sizeof(rx));
+  if (TF_ReadBlock(TF_TEST_BLOCK, rx) != TF_OK)
+  {
+    printf("[TF] 回读失败\r\n");
+    return;
+  }
+
+  if (memcmp(tx, rx, TF_BLOCK_SIZE) == 0)
+  {
+    printf("★ TF 卡块回环校验通过\r\n");
+    printf("[TF] 读回内容：%.20s\r\n", rx);
+  }
+  else
+  {
+    for (i = 0; i < TF_BLOCK_SIZE; i++)
+    {
+      if (tx[i] != rx[i])
+      {
+        printf("✗ 第 %lu 字节不一致：写 0x%02X / 读 0x%02X\r\n",
+               (unsigned long)i, tx[i], rx[i]);
+        break;
+      }
+    }
+  }
+}
+```
+
+> **`memcpy(tx, "TF-CARD SPI TEST OK!", 20)` 的作用**：在二进制递增数据前面盖一段可读文本。这样回读后**肉眼就能看出对不对**——打印出来是 `TF-CARD SPI TEST OK!` 就一眼确认"通了"。
+
+#### 技能点 2　读块 0 检查文件系统
+
+##### 知识点 1　块 0 的 0x55AA 签名
+
+```c
+void TF_DumpBlock0(void)
+{
+  static uint8_t buf[TF_BLOCK_SIZE];
+
+  if (TF_ReadBlock(0, buf) != TF_OK) return;
+
+  printf("[TF] 块 0 前 16 字节：");
+  for (int i = 0; i < 16; i++) printf("%02X ", buf[i]);
+  printf("\r\n");
+
+  if ((buf[510] == 0x55) && (buf[511] == 0xAA))
+    printf("[TF] 检测到有效引导扇区（卡已格式化）\r\n");
+  else
+    printf("[TF] 块 0 无 0x55AA 标记（卡可能未格式化）\r\n");
+}
+```
+
+> **`0x55 0xAA` 是 FAT 文件系统引导扇区的"签名"**，位于偏移 510/511。这个小检查能一次性区分"卡读写正常但没格式化"和"卡读写本身就不通"——**后者是硬件问题，前者重新格式化就好。**
+
+##### 知识点 2　TF 卡故障速查
+
+**表 8-4 TF 卡故障速查**
+
+| 现象 | 最可能原因 | 排查步骤 | 解决方案 |
+| --- | --- | --- | --- |
+| `TF_Check()` 返回 `0xFF` | ① 卡没插好 ② 供电不足 ③ 模式不是 0 ④ 少了 80 个暖机时钟 | 量 VDD=3.3V，看 CS/MISO | 补 80 时钟、确认 CPOL=0/CPHA=1Edge |
+| CMD0 有响应但 ACMD41 一直 `0x01` | ① 循环里没延时 ② 参数没置 HCS 位 | 看 ACMD41 参数 | 加 `HAL_Delay(10)`；参数用 `0x40000000` |
+| CMD8 返回 `0x05` | v1 老卡（正常现象） | — | 代码已按 v1 处理 |
+| CMD17 返回 `0x40` | 块号超出卡容量 | 打印块号与卡容量 | 换合法块号 |
+| 读块时等不到 `0xFE` | R1 不是 0x00 就开始等了 | 检查 R1 判断逻辑 | **先判 R1，再等令牌** |
+| 写块"成功"但读回不对 | 数据应答判断错 / 没等 BUSY | 看是否判 `(resp & 0x1F) == 0x05` | 补 BUSY 等待（MISO 回到非 0x00） |
+| 写卡时程序复位 | 电源跌落（卡写入瞬态电流大） | 量写入瞬间 VDD | 加 10µF~100µF 储能电容 |
+| 拔卡后程序死等 | 没有超时机制 | 看每个 while 循环 | 全部加超时并返回错误码 |
+| **TF 卡不响应但 FLASH 正常** | 总线切换没切到 TF 侧 | 示波器看 PA5 有无 SCK | 查 `BUS_Select(BUS_DEV_TF,...)` 的分支 |
+
+---
+
 <!--CHUNK-END-->
