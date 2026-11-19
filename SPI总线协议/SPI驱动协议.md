@@ -308,17 +308,17 @@ STM32F4 的调试接口支持两种协议，二者共用 PA13/PA14：
 
 **表 1-10 本项目的最终引脚分配表（写进 CubeMX 之前先核对这张表）**
 
-| 器件 | 信号 | STM32 引脚 | CubeMX 初配 | 运行期切换 | 复用编号 |
-| --- | --- | --- | --- | --- | --- |
-| W25Q64 | CS#（片选） | **PA15** | GPIO_Output（High） | 不切换 | — |
-| W25Q64 | CLK | **PB3** | GPIO_Output（Low） | ↔ **AF5** | **AF5** |
-| W25Q64 | DO（MISO） | **PB4** | GPIO_Output（Low） | ↔ **AF5** | **AF5** |
-| W25Q64 | DI（MOSI） | **PB5** | GPIO_Output（Low） | ↔ **AF5** | **AF5** |
-| TF 卡 | CS | **PA4** | GPIO_Output（High） | 不切换 | — |
-| TF 卡 | SCK | **PA5** | **AF5**（SPI1） | ↔ 模拟态 | **AF5** |
-| TF 卡 | MISO | **PA6** | **AF5**（SPI1） | ↔ 模拟态 | **AF5** |
-| TF 卡 | MOSI | **PA7** | **AF5**（SPI1） | ↔ 模拟态 | **AF5** |
-| 调试 | SWDIO / SWCLK | PA13 / PA14 | SYS | 不切换 | — |
+| 器件     | 信号            | STM32 引脚    | CubeMX 初配         | 运行期切换     | 复用编号    |
+| ------ | ------------- | ----------- | ----------------- | --------- | ------- |
+| W25Q64 | CS#（片选）       | **PA15**    | GPIO_Output（High） | 不切换       | —       |
+| W25Q64 | CLK           | **PB3**     | GPIO_Output（Low）  | ↔ **AF5** | **AF5** |
+| W25Q64 | DO（MISO）      | **PB4**     | GPIO_Output（Low）  | ↔ **AF5** | **AF5** |
+| W25Q64 | DI（MOSI）      | **PB5**     | GPIO_Output（Low）  | ↔ **AF5** | **AF5** |
+| TF 卡   | CS            | **PA4**     | GPIO_Output（High） | 不切换       | —       |
+| TF 卡   | SCK           | **PA5**     | **AF5**（SPI1）     | ↔ 模拟态     | **AF5** |
+| TF 卡   | MISO          | **PA6**     | **AF5**（SPI1）     | ↔ 模拟态     | **AF5** |
+| TF 卡   | MOSI          | **PA7**     | **AF5**（SPI1）     | ↔ 模拟态     | **AF5** |
+| 调试     | SWDIO / SWCLK | PA13 / PA14 | SYS               | 不切换       | —       |
 
 > **为什么 CubeMX 里 SPI1 配在 PA5/PA6/PA7 而不是 PB3/PB4/PB5**：CubeMX **只允许给一个外设分配一组引脚**。我们选 TF 卡那组作为"SPI1 的主位置"（它物理上只能是 SPI1），另一组 PB3/PB4/PB5 在 CubeMX 里先配成**普通 GPIO 输出**，**运行期由我们自己的总线层接管**（改成 AF5 或模拟态），CubeMX 不会再管它们。
 
