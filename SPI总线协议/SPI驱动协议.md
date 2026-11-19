@@ -933,7 +933,7 @@ PCLK2    =  84 MHz   ← SPI1 用
 | User Label | **W25Q64_CS** | **TF_CS** | 起别名，代码里好读 |
 
 > **`User Label` 的作用**：填了别名后，CubeMX 会在 `main.h` 里生成 `#define W25Q64_CS_Pin GPIO_PIN_15` 和 `#define W25Q64_CS_GPIO_Port GPIOA`，代码里可以直接用 `HAL_GPIO_WritePin(W25Q64_CS_GPIO_Port, W25Q64_CS_Pin, GPIO_PIN_RESET)`，**引脚改名时不用全局搜索替换**。
-
+![](QQ_1795053143078.png)
 ##### 知识点 2　初始电平为什么必须是高
 
 CS 的低电平是"选中"。**上电瞬间如果 CS 是低，从机就会以为自己被选中，等待命令**——而 CPU 还在跑启动代码，没有时钟过来，从机就一直挂着。等程序真正开始通讯时，从机内部状态机可能已经错位。
@@ -963,16 +963,16 @@ HAL_GPIO_Init(W25Q64_CS_GPIO_Port, &GPIO_InitStruct);                 /* 再配�
 
 **表 4-3 SPI3 的 Parameter Settings（W25Q64）**
 
-| 配置项 | 取值 | 依据 |
-| --- | --- | --- |
-| Frame Format | Motorola | 标准 SPI 格式（TI 格式不用） |
-| Data Size | **8 Bits** | W25Q64 是字节流器件 |
-| First Bit | **MSB First** | 手册规定高位先行 |
-| Prescaler | **2** → 21MHz | PCLK1=42MHz ÷2 |
-| Clock Polarity (CPOL) | **High** | 模式 3 |
-| Clock Phase (CPHA) | **2 Edge** | 模式 3 |
-| CRC Calculation | Disabled | 不用硬件 CRC |
-| NSS Signal Type | **Software** | 软件片选 |
+| 配置项                   | 取值            | 依据                 |
+| --------------------- | ------------- | ------------------ |
+| Frame Format          | Motorola      | 标准 SPI 格式（TI 格式不用） |
+| Data Size             | **8 Bits**    | W25Q64 是字节流器件      |
+| First Bit             | **MSB First** | 手册规定高位先行           |
+| Prescaler             | **2** → 21MHz | PCLK1=42MHz ÷2     |
+| Clock Polarity (CPOL) | **High**      | 模式 3               |
+| Clock Phase (CPHA)    | **2 Edge**    | 模式 3               |
+| CRC Calculation       | Disabled      | 不用硬件 CRC           |
+| NSS Signal Type       | **Software**  | 软件片选               |
 
 > 校验一句：**Mode 3 在 CubeMX 里就是 CPOL=High + CPHA=2 Edge**，对应野火第 24 章代码里的 `CLKPolarity = SPI_POLARITY_HIGH` + `CLKPhase = SPI_PHASE_2EDGE`。**两本资料写法不同，指的是同一件事。**
 
