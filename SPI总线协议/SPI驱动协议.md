@@ -2284,7 +2284,7 @@ int W25Q64_Init(void)
   {
     printf("[W25Q64] 错误：ID 不匹配（读到 0x%06lX，期望 0x%06lX）\r\n",
            (unsigned long)id, (unsigned long)W25Q64_JEDEC_ID);
-    printf("         若"像但不完全像"，多半是 CPOL/CPHA 模式不对\r\n");
+    printf("         若读到的值'像但不完全像'，多半是 CPOL/CPHA 模式不对\r\n");
   }
   return W25Q64_ERR_ID;
 }
