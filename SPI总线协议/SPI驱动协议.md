@@ -838,11 +838,11 @@ W25Q64_CS_HIGH();
 4. 双击进入工程，界面切换到 **Pinout & Configuration**。
 
 ![](QQ_1795052388192.png)
-![](QQ_1795052431271.png)
+
 ![](QQ_1795052460577.png)
-![](QQ_1795052541447.png)
 
 
+![](QQ_1795052907414.png)
 ##### 知识点 2　工程命名与路径
 
 **Project Manager → Project** 页填写：
@@ -870,7 +870,7 @@ W25Q64_CS_HIGH();
    - AHB Prescaler = **/1** → HCLK = 168MHz；
    - APB1 Prescaler = **/4** → **PCLK1 = 42MHz**（SPI2/SPI3 的时钟源）；
    - APB2 Prescaler = **/2** → **PCLK2 = 84MHz**（SPI1 的时钟源）。
-
+![](QQ_1795052541447.png)
 > **这一页是后面所有速率计算的地基**：SPI3 的最高 21MHz、SPI1 的最高 42MHz、TF 卡初始化的 328kHz，全部由这里的 PCLK1/PCLK2 推出来。**改了时钟树，前面任务二算的账要重算。**
 
 ##### 知识点 2　验证时钟配置
@@ -901,7 +901,7 @@ PCLK2    =  84 MHz   ← SPI1 用
 4. **Timebase Source** 保持 **SysTick**（HAL_Delay 依赖它）。
 
 > **操作顺序很重要**：**一定要先配 SYS，再配 SPI3**。反过来的话，你先点 PB3 准备配 SPI3_SCK，CubeMX 会因为 JTAG 占用而拒绝，或者给你一个带警告的黄色引脚。
-
+![](QQ_1795052431271.png)
 ##### 知识点 2　配置完的自检
 
 **表 4-1 SYS 配置后的引脚状态**
