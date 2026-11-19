@@ -3,15 +3,23 @@
 > **本章参考资料**：《STM32F4xx 中文数据手册》SPI 引脚复用表、《RM0090 STM32F407 参考手册》SPI/I2S 章节、《W25Q64FV 数据手册》（指令集与时序）、《SD Specifications Part 1 Physical Layer Simplified Specification》（SPI 模式），以及野火《STM32 HAL 库开发实战指南——基于霸天虎开发板》**第 24 章 SPI-读写串行 FLASH**（本章的协议讲解、指令表与驱动写法以此为基础改写，并扩展为"一条 SPI1 共享总线挂两个器件"）。
 > **学习提示**：配合参考手册中 `SPI_CR1`（CPOL/CPHA/MSTR/BR/SPE/SSI/DFF）、`SPI_CR2`（中断与 DMA 使能）、`SPI_SR`（TXE/RXNE/BSY/OVR/MODF）三个寄存器的说明一起阅读，效果更佳。
 > **特别说明**：本笔记以 **STM32F407VET6**（LQFP100 封装）资源讲解，外设配置全部通过 **STM32CubeMX** 完成，代码基于 **STM32 HAL 库**，所有实验结果**通过 USART1 + printf 输出到串口助手**（115200-8-N-1）。
-> **本项目的两件被驱动对象与引脚**（工程实际接线表）：
+> **本项目的两件被驱动对象与引脚**（目标接线表）：
 >
 > | 器件 | 协议 | CS | CLK | MISO | MOSI |
 > | --- | --- | --- | --- | --- | --- |
-> | **TF-CARD** | SPI | **PA4** | **PA5** | **PA6** | **PA7** |
+> | **TF-CARD**（规划中） | SPI | **PA4** | **PA5** | **PA6** | **PA7** |
 > | **Flash（W25Q64）** | SPI | **PA15** | **PB3** | **PB4**（SDO） | **PB5**（SDI） |
 >
+> ⚠️ **当前工程的真实状态**（重要，先看清再往下读）：
+> - **只挂了 W25Q64 一颗器件**。`SPI_Storage.ioc` 里**没有** PA4~PA7，`HAL_SPI_MspInit()` 里**只配了 PB3/PB4/PB5** 三根信号线；
+> - PA15 在 CubeMX 里被配成 **GPIO_Output**，User Label 是 **`FLASH_CS`**，所以 `main.h` 里生成的是 `FLASH_CS_Pin` / `FLASH_CS_GPIO_Port`；
+> - `spi.c` 里 SPI1 是 **模式 3**（`SPI_POLARITY_HIGH` + `SPI_PHASE_2EDGE`）、**÷2**（42MHz）；
+> - 工程里**还没有** `bsp_tfcard.c/h`，任务八的 TF 卡代码是**待实现内容**。
+>
+> **下文凡是提到"两器件共享总线"的地方，都是在讲"把 TF 卡也接上来之后"的目标形态**；单挂 Flash 的现状只需看 PB3/PB4/PB5 + PA15 这组引脚。
+>
 > **本项目全部使用 SPI1**，两组引脚**都是 SPI1 的 AF5 复用引脚**。
-> **重要澄清**：`PA5/PB3` 都是 `SPI1_SCK`、`PA6/PB4` 都是 `SPI1_MISO`、`PA7/PB5` 都是 `SPI1_MOSI`。**这 6 根信号线一次性全部配成 AF5，运行期永不改动**；`PA4` 与 `PA15` 是两个**普通 GPIO 片选**，程序通过"拉低哪一根 CS"来决定与谁通讯。
+> **重要澄清**：`PA5/PB3` 都是 `SPI1_SCK`、`PA6/PB4` 都是 `SPI1_MISO`、`PA7/PB5` 都是 `SPI1_MOSI`。挂满两器件时，**这 6 根信号线一次性全部配成 AF5，运行期永不改动**；`PA4` 与 `PA15` 是两个**普通 GPIO 片选**，程序通过"拉低哪一根 CS"来决定与谁通讯。
 > 所以本项目**没有引脚切换、没有分时复用**——**共享总线 + 独立片选**，这正是 SPI 多从机的标准做法。
 
 ---
@@ -51,7 +59,7 @@
 | 一 | 项目导入与需求拆解 | 把需求翻译成引脚、外设与验收指标 | 产出一张共享总线引脚分配表 |
 | 二 | SPI 协议认知 | 说清物理层与协议层 | 能画出模式 0 的时序并说明采样沿 |
 | 三 | STM32 SPI 外设认知 | 看懂框图、寄存器与 HAL 封装 | 能默写主机收发四步流程 |
-| 四 | CubeMX 工程搭建 | 生成可编译的工程骨架 | 8 根信号线全部 AF5，无引脚告警 |
+| 四 | CubeMX 工程搭建 | 生成可编译的工程骨架 | 信号线全部 AF5，无引脚告警（单挂 Flash 只有 PB3/4/5；挂满两器件才需 6 根） |
 | 五 | **SPI1 公共总线层** | 用一套 API 选中器件并切换速率 | 选中谁就只有谁响应 |
 | 六 | W25Q64 驱动开发 | 提供**完整可编译**的驱动文件 | `bsp_w25q64.c` 全部函数实现 |
 | 七 | W25Q64 联调验证 | 串口打印回环与掉电校验结果 | 校验一致、断电后数据完好 |
@@ -201,7 +209,7 @@ STM32 的引脚是"复用"的：同一个物理引脚，靠寄存器里写入的
 | 对比项 | ❌ 引脚分时复用（错误做法） | ✅ 共享总线 + 片选（正确做法） |
 | --- | --- | --- |
 | 6 根信号线的配置 | 运行期反复在 AF5 与模拟态之间切换 | **一次性配成 AF5，永不改动** |
-| 是否需要切换 CPOL/CPHA | 需要（每次切换都要关外设重配） | **不需要**（两个器件统一模式 0） |
+| 是否需要切换 CPOL/CPHA | 需要（每次切换都要关外设重配） | **不需要**（一旦挂两器件就统一成模式 0，运行期不再改） |
 | 切换开销 | 每次约 2~5µs | **0** |
 | 代码复杂度 | 多一个 `bsp_spi1_bus` 切换层，约 260 行 | **只需一个选器件的函数，约 40 行** |
 | MISO 冲突风险 | 有（要靠模拟态硬隔离） | **无**（靠 CS 让从机自己释放） |
@@ -219,11 +227,17 @@ STM32 的引脚是"复用"的：同一个物理引脚，靠寄存器里写入的
 | --- | --- | --- | --- |
 | 数据帧 | 8 位 | 8 位 | ✅ 一致 |
 | 位序 | MSB 先行 | MSB 先行 | ✅ 一致 |
-| **CPOL/CPHA** | **支持模式 0 和模式 3** | **只支持模式 0** | ✅ **取模式 0** |
+| **CPOL/CPHA** | **模式 0 和模式 3 都支持** | **只支持模式 0** | ✅ **本项目单挂 Flash，用模式 3；将来挂 TF 卡则必须改模式 0** |
 | 时钟 | 最高 104MHz（0x03 读约 50MHz） | 最高 25MHz（初始化 ≤400kHz） | ✅ 取 21MHz |
 
-> **关键结论**：总线共享后，**SPI1 的 CPOL/CPHA 只能有一个值**。TF 卡只支持模式 0，所以**整个总线统一用模式 0**。
-> 好消息是 **W25Q64 同时支持模式 0 和模式 3**（数据手册 SPI Mode 0 & Mode 3），所以 FLASH 用模式 0 完全没问题。**野火第 24 章用的是模式 3，照抄的话必须改这两行——这是本项目最容易踩的坑。**
+> **本项目的实际情况**：工程里**只挂了 W25Q64 一颗器件**（引脚表见上），`spi.c` 生成的是 **模式 3**：
+> ```c
+> hspi1.Init.CLKPolarity = SPI_POLARITY_HIGH;   /* CPOL = 1 */
+> hspi1.Init.CLKPhase    = SPI_PHASE_2EDGE;     /* CPHA = 1 */
+> ```
+> **W25Q64 对模式 0 和模式 3 都支持**（数据手册明确写 "SPI Mode 0 & Mode 3"），所以单挂 Flash 时两种模式都能正常工作。
+>
+> ⚠️ **将来要把 TF 卡也挂到这条总线上时，必须把模式改成 0**（`SPI_POLARITY_LOW` + `SPI_PHASE_1EDGE`），因为 SD 规范规定 SPI 模式固定 CPOL=0、CPHA=0。**共享总线只能有一个 CPOL/CPHA，取交集就只能取模式 0。** 好消息是 W25Q64 换成模式 0 后照常工作，**只改这两行，Flash 驱动一行不用动**。
 
 ---
 
@@ -242,9 +256,13 @@ STM32 的引脚是"复用"的：同一个物理引脚，靠寄存器里写入的
 | PA13 | JTMS / **SWDIO** | 保留（调试用） | 保留 |
 | PA14 | JTCK / **SWCLK** | 保留（调试用） | 保留 |
 | **PA15** | **JTDI** | Flash 的 CS | ⚠️ **冲突，必须释放** |
-| **PB3** | **JTDO / TRACESWO** | SPI1_SCK（第二组） | ⚠️ **冲突，必须释放** |
-| **PB4** | **NJTRST** | SPI1_MISO（第二组） | ⚠️ **冲突，必须释放** |
-| PB5 | 无（默认普通 IO） | SPI1_MOSI（第二组） | 不冲突 |
+| **PB3** | **JTDO / TRACESWO** | SPI1_SCK | ⚠️ **冲突，必须释放** |
+| **PB4** | **NJTRST** | SPI1_MISO | ⚠️ **冲突，必须释放** |
+| PB5 | 无（默认普通 IO） | SPI1_MOSI | 不冲突 |
+
+> **本工程已确认正确**：`SPI_Storage.ioc` 里 `PA13.Mode=Serial_Wire`、`PA14.Mode=Serial_Wire`，说明 Debug 选的就是 **Serial Wire**，PA15/PB3/PB4 已从 JTAG 释放。**烧录后能正常读 ID 就是这一项配对了的直接证据。**
+>
+> ⚠️ **一个容易忽略的点**：**"释放 JTAG"是靠 Debug 选 Serial Wire 实现的，不是靠代码里写一句 remap**。STM32F4 没有 F1 那种 `__HAL_AFIO_REMAP_SWJ_NOJTAG()`（那是 F1 的 AFIO 时代产物），F4 上 PB3 能被复用成 `SPI1_SCK` 靠的是 **AF5 复用 + JTAG-DP 已被关闭**这两件事同时成立。所以**不要去找那个宏，去查 CubeMX 的 SYS → Debug 设置**。
 
 ##### 知识点 2　SWD 与 JTAG 的取舍
 
@@ -487,14 +505,14 @@ uint8_t SPI_ReadByte(void)
 
 **表 2-3 SPI 的四种模式**
 
-| 模式 | CPOL | CPHA | 空闲时 SCK | 采样时刻 | 数据切换时刻 | 本项目 |
+| 模式 | CPOL | CPHA | 空闲时 SCK | 采样时刻 | 数据切换时刻 | 本工程（单挂 W25Q64） |
 | --- | --- | --- | --- | --- | --- | --- |
-| **模式 0** | 0 | 0 | 低电平 | 奇数边沿（上升沿） | 偶数边沿（下降沿） | ✅ **两器件都用** |
+| **模式 0** | 0 | 0 | 低电平 | 奇数边沿（上升沿） | 偶数边沿（下降沿） | ✅ 挂 TF 卡时必须用它 |
 | 模式 1 | 0 | 1 | 低电平 | 偶数边沿（下降沿） | 奇数边沿（上升沿） | — |
 | 模式 2 | 1 | 0 | 高电平 | 奇数边沿（下降沿） | 偶数边沿（上升沿） | — |
-| 模式 3 | 1 | 1 | 高电平 | 偶数边沿（上升沿） | 奇数边沿（下降沿） | ❌ 不能用（TF 卡不支持） |
+| **模式 3** | 1 | 1 | 高电平 | 偶数边沿（上升沿） | 奇数边沿（下降沿） | ✅ **本工程 spi.c 当前配置**（W25Q64 支持） |
 
-**模式 0 的时序（本项目唯一使用的模式）**：
+**模式 0 的时序（将来挂 TF 卡时必须切到这个模式）**：
 
 ```
 NSS   ‾‾‾\_________________________________________/‾‾‾
@@ -506,21 +524,19 @@ MISO  ──X═D7═X═D6═X═ … ═X═D0═X─────────�
           ↑ 同样在上升沿采样
 ```
 
-##### 知识点 2　为什么本项目必须统一用模式 0
-
-这是共享总线带来的**硬约束**：
+##### 知识点 2　本工程为什么是模式 3
 
 **表 2-4 模式选择的推导**
 
-| 器件 | 支持的模式 | 说明 |
+| 场景 | 可用模式 | 说明 |
 | --- | --- | --- |
-| W25Q64 | **模式 0** 和 **模式 3** | 数据手册明确支持两种 |
-| TF 卡 | **只有模式 0** | SD 规范规定 SPI 模式固定 CPOL=0、CPHA=0 |
+| 只挂 W25Q64 | **模式 0 或模式 3 都行** | W25Q64 数据手册明确支持两种 |
+| 同时挂 TF 卡 | **只能是模式 0** | SD 规范规定 SPI 模式固定 CPOL=0、CPHA=0 |
 | **共享总线** | **只能有一个 CPOL/CPHA** | 因为两组引脚同时挂在同一个 SPI1 上 |
-| **结论** | **全总线用模式 0** | 取交集，两器件都满足 |
+| **本工程（单挂 Flash）** | **模式 3** | `spi.c` 里 `SPI_POLARITY_HIGH` + `SPI_PHASE_2EDGE` |
 
-> ⚠️ **这是本项目最容易踩的坑**：野火第 24 章的 FLASH 驱动用的是**模式 3**（`SPI_POLARITY_HIGH` + `SPI_PHASE_2EDGE`）。**如果你照抄野火的初始化结构体，TF 卡就完全无法工作**（CMD0 发出去没响应）。
-> **解决办法**：把 `CLKPolarity` 改成 `SPI_POLARITY_LOW`、`CLKPhase` 改成 `SPI_PHASE_1EDGE`。**W25Q64 对两种模式都支持，改完照常工作。**
+> ⚠️ **这是最容易出问题的一处认知**：野火第 24 章用的是**模式 3**（`SPI_POLARITY_HIGH` + `SPI_PHASE_2EDGE`），本工程的 `spi.c` 也是模式 3——**单挂 W25Q64 完全没问题，已经验证能正常读出 `0xEF4017`**。
+> 但**一旦你要把 TF 卡并联到这条总线上**，就必须把 `CLKPolarity` 改成 `SPI_POLARITY_LOW`、`CLKPhase` 改成 `SPI_PHASE_1EDGE`，**否则 TF 卡会完全无响应**（CMD0 发出去收不到 R1）。改完之后 W25Q64 照常工作。
 
 ##### 知识点 3　模式不匹配时的症状
 
@@ -532,7 +548,7 @@ MISO  ──X═D7═X═D6═X═ … ═X═D0═X─────────�
 | 模式 0 | 模式 3 | 首字节丢失或末字节丢一位 |
 | 任一 | 任一 | 偶尔能通、偶尔不通（时序处于临界） |
 
-> **排错方法**：先用**模式 0**（本项目要求），不通再换**模式 3**。**但注意：换成模式 3 之后 TF 卡一定不工作**，所以模式 3 只能用来单独验证 FLASH。
+> **排错方法**：先用**模式 0**，不通再换**模式 3**。**注意：换成模式 3 之后 TF 卡一定不工作**，所以模式 3 只能用来单独验证 FLASH。**本工程只挂 Flash，实测模式 3 正常；一旦要加挂 TF 卡，必须回到模式 0。**
 
 ---
 
@@ -656,22 +672,23 @@ SCK 频率完全由 `CR1` 里的 `BR[2:0]` 三位决定，**只能是 2 的整�
 
 **表 3-2 BR[2:0] 分频对照（本项目 SPI1 挂 APB2 = 84MHz）**
 
-| BR[2:0] | 分频 | HAL 宏 | SPI1 实际 SCK | 本项目用途 |
+| BR[2:0] | 分频 | HAL 宏 | SPI1 实际 SCK | 本工程用途 |
 | --- | --- | --- | --- | --- |
-| 000 | ÷2 | `SPI_BAUDRATEPRESCALER_2` | 42 MHz | （可选）提速 |
-| 001 | ÷4 | `SPI_BAUDRATEPRESCALER_4` | **21 MHz** | **FLASH / TF 卡工作** |
+| 000 | ÷2 | `SPI_BAUDRATEPRESCALER_2` | 42 MHz | **`spi.c` 生成的初值**（W25Q64 上位机余量偏紧） |
+| 001 | ÷4 | `SPI_BAUDRATEPRESCALER_4` | **21 MHz** | **`BUS_SPEED_21M`：Flash 日常读写**（推荐） |
 | 010 | ÷8 | `SPI_BAUDRATEPRESCALER_8` | 10.5 MHz | 调试降速 |
 | 011 | ÷16 | `SPI_BAUDRATEPRESCALER_16` | 5.25 MHz | 调试降速 |
 | 100 | ÷32 | `SPI_BAUDRATEPRESCALER_32` | 2.625 MHz | — |
 | 101 | ÷64 | `SPI_BAUDRATEPRESCALER_64` | 1.3125 MHz | — |
 | 110 | ÷128 | `SPI_BAUDRATEPRESCALER_128` | 656 kHz | — |
-| 111 | ÷256 | `SPI_BAUDRATEPRESCALER_256` | **328 kHz** | **TF 卡初始化** |
+| 111 | ÷256 | `SPI_BAUDRATEPRESCALER_256` | **328 kHz** | **`BUS_SPEED_328K`：TF 卡初始化必须 ≤400kHz** |
 
 > **本项目只有一个 SPI1，所以分频值只有这一列**——不用再记两个基准时钟。
+> **注意 `spi.c` 生成的初值是 ÷2（42MHz）**，而总线层 `BUS_SPEED_21M` 是 ÷4。**W25Q64 的 `0x03` 读指令手册上限约 50MHz，42MHz 虽然在范围内但余量很小**；一旦排线较长或电源纹波大，就容易偶发误码。**建议业务代码统一用 `BUS_SPEED_21M`。**
 
 ##### 知识点 2　选分频的三条实践规则
 
-1. **先查从机的上限**：W25Q64 标准读（03h）最高约 50MHz，TF 卡 SPI 模式最高 25MHz。本项目统一取 21MHz，两者都满足；
+1. **先查从机的上限**：W25Q64 标准读（03h）最高约 50MHz，TF 卡 SPI 模式最高 25MHz。**本工程单挂 Flash，总线层取 21MHz 有充足余量**；
 2. **初始化降速，通信提速**：TF 卡识别阶段必须 ≤400kHz，识别完再切 21MHz；
 3. **留余量**：**调试期先降到 1~5MHz 跑通，再逐步提高**。
 
@@ -708,14 +725,14 @@ typedef struct {
 | Mode | `Mode` | Master | 两块存储都是从机 |
 | Direction | `Direction` | 2 Lines Full Duplex | 全双工 |
 | Data Size | `DataSize` | 8 Bits | 两者都是 8 位帧 |
-| **Clock Polarity (CPOL)** | `CLKPolarity` | **Low** | **模式 0，两器件共用** |
-| **Clock Phase (CPHA)** | `CLKPhase` | **1 Edge** | **模式 0，两器件共用** |
+| **Clock Polarity (CPOL)** | `CLKPolarity` | **High** | **模式 3，本工程单挂 Flash 的实测配置** |
+| **Clock Phase (CPHA)** | `CLKPhase` | **2 Edge** | **模式 3** |
 | NSS Signal Type | `NSS` | **Software** | 都用 GPIO 片选 |
 | Prescaler | `BaudRatePrescaler` | **256（初值）→ 运行期改 4** | TF 卡初始化必须降速 |
 | First Bit | `FirstBit` | MSB First | 两者都是高位先行 |
 | CRC Calculation | `CRCCalculation` | Disabled | 不用 SPI 硬件 CRC |
 
-> **注意：CPOL/CPHA 全程只有一个值（模式 0）**，不再需要"按器件切换模式"。
+> **注意：CPOL/CPHA 全程只有一个值**，不需要"按器件切换模式"。本工程单挂 Flash 用模式 3；**等到要加挂 TF 卡时，才回来把这两项统一改成模式 0**。
 
 ##### 知识点 2　两个容易被忽略的坑
 
@@ -731,10 +748,25 @@ typedef struct {
 
 | API | 方向 | 用途 | 本项目的使用场景 |
 | --- | --- | --- | --- |
-| `HAL_SPI_Transmit()` | 只发 | 发送 N 字节，接收内容被丢弃 | 发送命令字节、连续写数据 |
-| `HAL_SPI_Receive()` | 只收 | 内部自动发 0xFF 产生时钟 | 连续读数据（TF 卡 512 字节块） |
-| **`HAL_SPI_TransmitReceive()`** | 收发 | **同时**发送与接收等长数据 | **单字节收发的地基** |
+| `HAL_SPI_Transmit()` | 只发 | 发送 N 字节，接收内容被丢弃（内部会读走 DR 防止 OVR） | 发送命令字节、连续写数据 |
+| `HAL_SPI_Receive()` | 只收 | 2 线全双工下内部转调 TransmitReceive，把接收缓冲同时当发送源 | **能用，但本笔记更推荐显式用 TransmitReceive**（见下方说明） |
+| **`HAL_SPI_TransmitReceive()`** | 收发 | **同时**发送与接收等长数据 | **单字节收发的地基、连续读数据** |
 | `HAL_SPI_Transmit_IT()` / `_DMA()` | 只发 | 中断/DMA 方式 | 大块数据搬运（本笔记用阻塞式讲原理） |
+
+> ⚠️ **关于 `HAL_SPI_Receive()` 的一个易踩点**：在"主机 + 2 线全双工（`SPI_DIRECTION_2LINES`）"下，它内部其实是这么走的：
+> ```c
+> /* stm32f4xx_hal_spi.c */
+> if ((hspi->Init.Mode == SPI_MODE_MASTER) && (hspi->Init.Direction == SPI_DIRECTION_2LINES))
+> {
+>   hspi->State = HAL_SPI_STATE_BUSY_RX;
+>   return HAL_SPI_TransmitReceive(hspi, pData, pData, Size, Timeout);  /* 收发同一缓冲 */
+> }
+> ```
+> 也就是说它**把接收缓冲区同时当发送源**——功能上能产生时钟，但有两个副作用：
+> ① 读到一半时缓冲区内容会被改写，**一旦超时，你无法判断哪些字节是真的收到了**；
+> ② 它先把 `State` 置成 `BUSY_RX` 再转调，如果你在外层还有别的 SPI 调用，状态机会很难排查。
+>
+> **所以驱动里推荐显式写法**：自己准备一个 dummy 字节，逐字节 `TransmitReceive`，失败时能确定地填 `0xFF`。**代码多几行，排查时少几小时。**
 
 `HAL_SPI_TransmitReceive()` 的原型与返回值：
 
@@ -885,16 +917,30 @@ W25Q64_CS_HIGH();
 ##### 知识点 1　168MHz 标准配置
 
 1. **System Core → RCC**：High Speed Clock (HSE) 选 **Crystal/Ceramic Resonator**；
-2. 切到 **Clock Configuration** 页：
-   - Input frequency = **8 MHz**；
+2. 切到 **Clock Configuration** 页（以下为**本工程 `SystemClock_Config()` 的实际参数**）：
+   - Input frequency = **8 MHz**（`HSE_VALUE = 8000000U`）；
    - PLL Source Mux = **HSE**；
-   - PLLM = **8**（8MHz ÷ 8 = 1MHz 进 VCO）；
-   - PLLN = **336**（1MHz × 336 = 336MHz）；
-   - PLLP = **2**（336 ÷ 2 = **168MHz** = SYSCLK）；
+   - **PLLM = 4**（8MHz ÷ 4 = **2MHz** 进 VCO）；
+   - **PLLN = 168**（2MHz × 168 = **336MHz** VCO 输出）；
+   - **PLLP = 2**（336 ÷ 2 = **168MHz** = SYSCLK）；
+   - **PLLQ = 4**（336 ÷ 4 = 84MHz，供 USB/SDIO 用）；
    - System Clock Mux = **PLLCLK**；
    - AHB Prescaler = **/1** → HCLK = 168MHz；
    - APB1 Prescaler = **/4** → PCLK1 = 42MHz；
    - **APB2 Prescaler = /2 → PCLK2 = 84MHz（SPI1 的时钟源，全篇速率都从这里推）**。
+
+> **对应的实际代码（`main.c` 的 `SystemClock_Config()`）**：
+> ```c
+> RCC_OscInitStruct.PLL.PLLM = 4;                  /* 8MHz / 4 = 2MHz */
+> RCC_OscInitStruct.PLL.PLLN = 168;                /* 2MHz × 168 = 336MHz */
+> RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;      /* 336 / 2 = 168MHz */
+> RCC_OscInitStruct.PLL.PLLQ = 4;                  /* 336 / 4 = 84MHz */
+> RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;   /* PCLK1 = 42MHz */
+> RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;   /* PCLK2 = 84MHz */
+> HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5);
+> ```
+>
+> ⚠️ **别把 PLLM/PLLN 记混**：网上很多 F407 例程写的是 `PLLM=8, PLLN=336`（1MHz 进 VCO），本工程是 `PLLM=4, PLLN=168`（2MHz 进 VCO）。**两组参数算出来都是 168MHz，都能用**，但 **VCO 输入频率必须落在 1~2MHz、VCO 输出必须落在 100~432MHz** 这个合法区间内。**改参数时不能只改一个**，否则要么超范围、要么频率不对。
 
 > **这一页是后面所有速率计算的地基**：SPI1 工作时的 21MHz（÷4）、TF 卡初始化的 328kHz（÷256），全部由 **PCLK2 = 84MHz** 推出来。
 
@@ -909,6 +955,39 @@ PCLK2    =  84 MHz   ← SPI1 用这个
 ```
 
 若显示 "Max frequency exceeded" 红字，说明某处分频不够。**F407 的 APB2 上限是 84MHz，SPI1 的最高 SCK 是 42MHz（÷2）。**
+
+##### 知识点 3　串口乱码与 `HSE_VALUE` 的隐藏关联
+
+**这是实际调试中最容易被误判成"SPI 出问题"的一类现象**：串口能输出，但全是 `鏭?壤瀋c瀈?` 这种乱码。**它不是 SPI 的问题，而是 UART 波特率算错了**，而波特率算错的根子往往在时钟上。
+
+`HAL_UART_Init()` 在算波特率时，用的是 `HAL_RCC_GetPCLK2Freq()`，而这个函数**不是测量出来的，是按 `HSE_VALUE` 宏反推的**：
+
+```c
+/* stm32f4xx_hal_rcc.c —— HAL_RCC_GetSysClockFreq() */
+pllvco = (HSE_VALUE * PLLN) / PLLM;      /* ★ 依赖 HSE_VALUE 宏 */
+sysclockfreq = pllvco / PLLP;
+/* stm32f4xx_hal_uart.c */
+pclk = HAL_RCC_GetPCLK2Freq();           /* ← 再乘 APB2 分频 */
+huart->Instance->BRR = UART_BRR_SAMPLING16(pclk, huart->Init.BaudRate);
+```
+
+**所以只要 `HSE_VALUE` 和板子上的真实晶振对不上，波特率就会成比例地错，串口必然乱码。** 本工程 `stm32f4xx_hal_conf.h` 里是：
+
+```c
+#define HSE_VALUE    8000000U    /* 8MHz 晶振 */
+```
+
+> ⚠️ **三个常见陷阱**：
+> 1. **板子是 25MHz 晶振，代码却按 8MHz 配** → 实际 PCLK2 变成 84×(25/8)≈262MHz（超频，通常直接跑飞）或按错误值算波特率 → 乱码；**注意 ST 官方模板默认 `HSE_VALUE` 是 25000000U，本工程被改成了 8000000U，换板子时务必核对**；
+> 2. **板子没有外部晶振**（只有内部 HSI 16MHz），却把 `HSEState` 配成 `RCC_HSE_ON` → `HAL_RCC_OscConfig()` 超时失败 → 程序走进 `Error_Handler()` 的 `while(1)`，**现象是"串口一个字都没有"**（比乱码更彻底）；
+> 3. **串口助手波特率设错**（比如代码 115200、助手设成 9600）→ 典型的"高位乱码夹零星 ASCII"。
+
+> **快速自检法**：上电先打印**自己能算出来的常量**，而不是只看数据：
+> ```c
+> printf("[BOOT] SYSCLK = %lu Hz\r\n", (unsigned long)HAL_RCC_GetHCLKFreq());
+> printf("[BOOT] PCLK2  = %lu Hz\r\n", (unsigned long)HAL_RCC_GetPCLK2Freq());
+> ```
+> 如果打印出来的数字**和预期（168000000 / 84000000）不同**，或者数字本身也是乱码，就能立刻区分是"时钟配错"还是"波特率设错"。**这行代码 5 秒钟就能省下半小时的瞎猜。**
 
 > 📷 图 4-2 Clock Configuration 时钟树配置（此处可插入截图）
 
@@ -957,9 +1036,15 @@ PCLK2    =  84 MHz   ← SPI1 用这个
 | GPIO mode | Output Push Pull | Output Push Pull | 推挽，不需要上拉 |
 | GPIO Pull-up/Pull-down | No pull-up and no pull-down | No pull-up and no pull-down | 板上有外部上拉的话这里不用管 |
 | Maximum output speed | **Very High** | **Very High** | 高速时 CS 边沿要陡 |
-| User Label | **TF_CS** | **W25Q64_CS** | 起别名，代码里好读 |
+| User Label | **TF_CS** | **FLASH_CS** | 起别名，代码里好读 |
 
-> **`User Label` 的作用**：填了别名后，CubeMX 会在 `main.h` 里生成 `#define W25Q64_CS_Pin GPIO_PIN_15` 和 `#define W25Q64_CS_GPIO_Port GPIOA`，代码里可以直接用，**引脚改名时不用全局搜索替换**。
+> **`User Label` 的作用**：填了别名后，CubeMX 会在 `main.h` 里按这个别名生成宏。**本工程实际生成的是**：
+> ```c
+> #define FLASH_CS_Pin        GPIO_PIN_15
+> #define FLASH_CS_GPIO_Port  GPIOA
+> ```
+> 代码里直接写 `HAL_GPIO_WritePin(FLASH_CS_GPIO_Port, FLASH_CS_Pin, GPIO_PIN_SET)` 即可，**引脚改名时不用全局搜索替换**。
+> ⚠️ **注意名字要对上**：如果你在 CubeMX 里填的 Label 是 `W25Q64_CS`，宏就是 `W25Q64_CS_Pin`；填 `FLASH_CS`，宏就是 `FLASH_CS_Pin`。**总线层代码里用到的名字必须和 CubeMX 生成的完全一致，否则编译直接报"未定义标识符"。**
 
 ##### 知识点 2　初始电平为什么必须是高
 
@@ -967,8 +1052,8 @@ CS 的低电平是"选中"。**上电瞬间如果 CS 是低，从机就会以为
 
 ```c
 /* CubeMX 生成的 gpio.c 里，会先写电平再初始化模式 */
-HAL_GPIO_WritePin(TF_CS_GPIO_Port, TF_CS_Pin, GPIO_PIN_SET);        /* 先给高 */
-HAL_GPIO_Init(TF_CS_GPIO_Port, &GPIO_InitStruct);                    /* 再配模式 */
+HAL_GPIO_WritePin(FLASH_CS_GPIO_Port, FLASH_CS_Pin, GPIO_PIN_SET);   /* 先给高 */
+HAL_GPIO_Init(FLASH_CS_GPIO_Port, &GPIO_InitStruct);                 /* 再配模式 */
 ```
 
 > **顺序不能反**：先配成输出再写高，中间那一瞬间引脚是低电平（复位默认值），从机可能误触发。**CubeMX 已按正确顺序生成**。
@@ -977,20 +1062,31 @@ HAL_GPIO_Init(TF_CS_GPIO_Port, &GPIO_InitStruct);                    /* 再配�
 
 ### 环节三　配置 SPI1（一次性配好两组引脚）
 
-#### 技能点 1　让 CubeMX 同时点亮 8 根信号线
+#### 技能点 1　让 CubeMX 点亮信号线（单器件 / 双器件两种做法）
 
 ##### 知识点 1　关键操作：先选第一组，再手工补第二组
 
-CubeMX 的默认行为是"一个外设只自动分配一组引脚"，但**它允许你手工把同一外设的第二组引脚也点上去**——因为 `PA5` 和 `PB3` 在芯片定义里**都是合法的 `SPI1_SCK`**。
+> **先分清两种情况**（这是本笔记最容易让人走错的地方）：
+>
+> | 场景 | CubeMX 里要做的 |
+> | --- | --- |
+> | **只挂 W25Q64（本工程现状）** | 选 Full-Duplex Master 后，**把自动分配到 PA5/PA6/PA7 的三根信号线取消掉**，然后手工把 **PB3 → SPI1_SCK、PB4 → SPI1_MISO、PB5 → SPI1_MOSI** 点上去。**只保留 PB 组这三根。** |
+> | **Flash + TF 卡都想挂** | 保留 PA5/PA6/PA7，**再手工把 PB3/PB4/PB5 也点成同一组 SPI1 信号**（见下方步骤）。 |
+>
+> **为什么本工程要"取消 PA 组"**：PA5/PA6/PA7 在你的板子上并没有接 TF 卡座。如果 CubeMX 把它们也配成 AF5，虽然不影响功能，但**会让三根引脚常年输出高速 SCK/MOSI，白白增加干扰和功耗**，还可能和板子上别的复用功能抢引脚。**用不到的引脚就不要分配。**
+>
+> **本工程的最终结果**（可在 `spi.c` 里核对）：只配置了 `GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5`，即 PB3/PB4/PB5。
 
-**操作步骤（这是本项目最关键的一步，务必按顺序做）**：
+**挂满两器件时的操作步骤**：
+
+CubeMX 的默认行为是"一个外设只自动分配一组引脚"，但**它允许你手工把同一外设的第二组引脚也点上去**——因为 `PA5` 和 `PB3` 在芯片定义里**都是合法的 `SPI1_SCK`**。
 
 1. 左侧 **Connectivity → SPI1**；
 2. **Mode** 下拉选 **Full-Duplex Master**；
 3. CubeMX 自动把 **PA5 → SPI1_SCK、PA6 → SPI1_MISO、PA7 → SPI1_MOSI** 点亮；
 4. **Hardware NSS Signal** 选 **Disable**（两路都用软件片选）；
 5. **手工把第二组补上**：在芯片图上依次左键点击 **PB3**，在弹出菜单里选 **`SPI1_SCK`**；再点 **PB4** 选 **`SPI1_MISO`**；再点 **PB5** 选 **`SPI1_MOSI`**；
-6. 此时芯片图上 **PA5/PB3 都会标成 SPI1_SCK，PA6/PB4 标成 SPI1_MISO，PA7/PB5 标成 SPI1_MOSI** —— **完全正常，这就是我们要的效果**。
+6. 此时芯片图上 **PA5/PB3 都会标成 SPI1_SCK，PA6/PB4 标成 SPI1_MISO，PA7/PB5 标成 SPI1_MOSI** —— **这就是双器件共享总线的效果**。
 
 > 📷 图 4-3 SPI1 同时点亮两组引脚（PA5/PB3 均为 SPI1_SCK）（此处可插入截图）
 
@@ -998,21 +1094,22 @@ CubeMX 的默认行为是"一个外设只自动分配一组引脚"，但**它允
 
 ##### 知识点 2　Parameter Settings 逐项填写
 
-**表 4-3 SPI1 的 Parameter Settings（两器件共用）**
+**表 4-3 SPI1 的 Parameter Settings（本工程单挂 Flash 的取值）**
 
 | 配置项 | 取值 | 依据 |
 | --- | --- | --- |
 | Frame Format | Motorola | 标准 SPI 格式 |
 | Data Size | **8 Bits** | 两个器件都是字节流 |
 | First Bit | **MSB First** | 两者都要求高位先行 |
-| Prescaler | **256**（→ 328kHz） | 上电初值给 TF 卡初始化用 |
-| **Clock Polarity (CPOL)** | **Low** | **模式 0（TF 卡强制要求）** |
-| **Clock Phase (CPHA)** | **1 Edge** | **模式 0** |
+| Prescaler | **2**（→ 42 MHz） | 本工程单挂 Flash，直接全速；总线层运行期会按需改分频 |
+| **Clock Polarity (CPOL)** | **High** | **本工程单挂 W25Q64，用模式 3** |
+| **Clock Phase (CPHA)** | **2 Edge** | **模式 3（CPHA=1）** |
 | CRC Calculation | Disabled | 不用硬件 CRC |
 | NSS Signal Type | **Software** | 两路都软件片选 |
 
-> **为什么 CPOL/CPHA 只能选模式 0**：TF 卡在 SPI 模式下**只支持模式 0**，而总线是共享的，所以整个 SPI1 只能有一个模式。**W25Q64 同时支持模式 0 和 3，用模式 0 完全没问题。**
-> **为什么初值分频选 256**：因为 `TF_Init()` 是上电后第一个要降到 ≤400kHz 的操作。用 328kHz 起步最安全，识别完成后再由总线层提速到 21MHz。
+> **为什么这里写 Pattern 3 而不是模式 0**：本工程只挂 W25Q64 一颗器件，`spi.c` 生成的就是 `SPI_POLARITY_HIGH` + `SPI_PHASE_2EDGE`，实测读 ID 正常。**W25Q64 支持模式 0 和模式 3 两种。**
+> ⚠️ **但如果你按本笔记任务八把 TF 卡也挂上总线，必须回来把这两项改成 `Low` + `1 Edge`（模式 0）**，否则 TF 卡不响应。
+> **关于初值分频**：本工程生成的是 `SPI_BAUDRATEPRESCALER_2`（42MHz）。W25Q64 的 `0x03` 读指令在 42MHz 下已接近上限，**调试期建议由总线层用 `BUS_SPEED_21M`（÷4）**，留出时序余量。若总线要挂 TF 卡，`TF_Init()` 阶段必须降到 `BUS_SPEED_328K`（÷256）。
 
 ##### 知识点 3　NVIC 与 DMA
 
@@ -1031,35 +1128,85 @@ CubeMX 的默认行为是"一个外设只自动分配一组引脚"，但**它允
 
 ##### 知识点 2　printf 重定向
 
-**Keil MDK（需在 Options → Target 勾选 Use MicroLIB）：**
+**Keil MDK（AC5 / AC6）：只需重定义 `fputc`**
 
 ```c
-/* USER CODE BEGIN 0 */
-#if defined(__CC_ARM) || defined(__ARMCC_VERSION)
-#pragma push
-#pragma micro_lib
-int fputc(int ch, FILE *f)
+/* USER CODE BEGIN PFP */
+static int uart_putchar(int ch)
 {
-  HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
+  uint8_t c = (uint8_t)ch;
+  HAL_UART_Transmit(&huart1, &c, 1, HAL_MAX_DELAY);
   return ch;
 }
-#pragma pop
+
+#if defined(__CC_ARM) || defined(__ARMCC_VERSION)
+/* Keil MDK：标准库把 printf 的每个字符送到 fputc() */
+int fputc(int ch, FILE *f)
+{
+  (void)f;
+  return uart_putchar(ch);
+}
 #endif
-/* USER CODE END 0 */
+/* USER CODE END PFP */
 ```
 
-**STM32CubeIDE（GCC）：**
+> ⚠️ **这里有一个非常隐蔽的坑，很多人的"串口一个字都不输出、程序像卡死了"就是它引起的。**
+>
+> 网上常见的写法是把 `fputc` 包在 `#if defined(__CC_ARM) || defined(__ARMCC_VERSION)` 里，**并且加上 `#pragma micro_lib`**。问题在于：
+> 1. `#pragma micro_lib` 只在使用 **MicroLIB**（Options → Target 里勾了 Use MicroLIB）时才有意义；用**标准 C 库**时它被直接忽略；
+> 2. 更要紧的是——**如果你的编译器既不定义 `__CC_ARM` 也不定义 `__ARMCC_VERSION`（例如某些 AC6 配置或 GCC 工程），整段 `fputc` 会被预处理掉**，于是 `printf` 回落到 **semihosting**（半主机模式）。
+> 3. semihosting 需要调试器接管，**脱机运行时程序会停在 `SVC_Handler` 里死等**——现象就是"能烧进去、但串口一个字都没有"。
+>
+> **两个稳妥的写法**：
+> - 要么在 Keil 里**明确勾选 Use MicroLIB**，并按上面写法保留 `fputc`；
+> - 要么**不要依赖编译器宏**，直接用 `__io_putchar` / `fputc` 双保险（下段代码）。
+> 最忌讳的是"宏条件写得很窄 + 又没勾 MicroLIB"，那样等于把 printf 交给 semihosting。
+
+**STM32CubeIDE（GCC，newlib）：**
 
 ```c
-/* USER CODE BEGIN 0 */
-#include <sys/stat.h>
-ssize_t _write(int fd, const void *pdata, size_t bytes)
+/* USER CODE BEGIN PFP */
+int __io_putchar(int ch)
 {
-  HAL_UART_Transmit(&huart1, (uint8_t *)pdata, bytes, HAL_MAX_DELAY);
-  return bytes;
+  uint8_t c = (uint8_t)ch;
+  HAL_UART_Transmit(&huart1, &c, 1, HAL_MAX_DELAY);
+  return ch;
 }
-/* USER CODE END 0 */
+
+int _write(int fd, char *ptr, int len)
+{
+  (void)fd;
+  HAL_UART_Transmit(&huart1, (uint8_t *)ptr, (uint16_t)len, HAL_MAX_DELAY);
+  return len;
+}
+/* USER CODE END PFP */
 ```
+
+**一个能同时兼容 AC5 / AC6 / GCC 的写法（推荐）**：
+
+```c
+static int uart_putchar(int ch)
+{
+  uint8_t c = (uint8_t)ch;
+  HAL_UART_Transmit(&huart1, &c, 1, HAL_MAX_DELAY);
+  return ch;
+}
+
+#if defined(__CC_ARM) || defined(__ARMCC_VERSION)
+int fputc(int ch, FILE *f)   /* Keil：printf → fputc */
+{
+  (void)f;
+  return uart_putchar(ch);
+}
+#elif defined(__GNUC__)
+int __io_putchar(int ch)     /* GCC：printf → _write → __io_putchar */
+{
+  return uart_putchar(ch);
+}
+#endif
+```
+
+> **验证方法**：上电后**第一件事**就打印一行 `printf("\r\n=== boot ===\r\n");`，放在所有 SPI 操作之前。这样一旦串口没反应，你能立刻分清是"UART 通路坏了"还是"SPI 那部分卡住了"——**避免把 printf 问题和 SPI 问题混在一起查**。
 
 > **串口在这里的角色不只是"打印"**：FLASH 和 TF 卡都没有"屏幕"，**所有判断都靠串口输出**。**printf 写得好不好，直接决定调试速度快不快。**
 
@@ -1072,37 +1219,53 @@ ssize_t _write(int fd, const void *pdata, size_t bytes)
 
 然后点 **GENERATE CODE**。
 
-##### 知识点 4　核对生成的 MspInit：8 根线必须全是 AF5
+##### 知识点 4　核对生成的 MspInit：信号线必须都是 AF5
+
+**本工程（只挂 W25Q64）实际生成的 `HAL_SPI_MspInit`（`spi.c`）**：
 
 ```c
-void HAL_SPI_MspInit(SPI_HandleTypeDef* hspi)
+void HAL_SPI_MspInit(SPI_HandleTypeDef* spiHandle)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
 
-  if (hspi->Instance == SPI1)
+  if (spiHandle->Instance == SPI1)
   {
     __HAL_RCC_SPI1_CLK_ENABLE();
-    __HAL_RCC_GPIOA_CLK_ENABLE();
-    __HAL_RCC_GPIOB_CLK_ENABLE();          /* ★ 第二组在 PB 口，必须开 GPIOB 时钟 */
+    __HAL_RCC_GPIOB_CLK_ENABLE();          /* ★ PB 口时钟，漏了就完全无信号 */
 
-    /* 第一组：PA5 = SPI1_SCK, PA6 = SPI1_MISO, PA7 = SPI1_MOSI */
-    GPIO_InitStruct.Pin       = GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7;
+    /**SPI1 GPIO Configuration
+    PB3  ------> SPI1_SCK
+    PB4  ------> SPI1_MISO
+    PB5  ------> SPI1_MOSI
+    */
+    GPIO_InitStruct.Pin       = GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5;
     GPIO_InitStruct.Mode      = GPIO_MODE_AF_PP;         /* 复用推挽 */
     GPIO_InitStruct.Pull      = GPIO_NOPULL;
     GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
     GPIO_InitStruct.Alternate = GPIO_AF5_SPI1;           /* ★ SPI1 是 AF5 */
-    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-    /* 第二组：PB3 = SPI1_SCK, PB4 = SPI1_MISO, PB5 = SPI1_MOSI */
-    GPIO_InitStruct.Pin       = GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5;
-    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);              /* 复用编号沿用上面的 AF5 */
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
   }
 }
 ```
 
+> **注意：本工程只挂 W25Q64，所以只配了 PB3/PB4/PB5 三根**（外加 PA15 作为普通 GPIO 片选，那个在 `gpio.c` 里配）。**这也说明"两组引脚同时配成 AF5"只有在真的要挂两颗器件时才需要**——单器件工程不必画蛇添足。
+>
+> **若要再挂 TF 卡（PA5/PA6/PA7），才需要补上第一组**：
+
+```c
+    /* 只有在总线上还要挂 TF 卡时，才追加这一段 */
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    GPIO_InitStruct.Pin       = GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7;
+    GPIO_InitStruct.Mode      = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull      = GPIO_NOPULL;
+    GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF5_SPI1;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+```
+
 > ⚠️ **两个必须核对的地方**：
-> ① **`__HAL_RCC_GPIOB_CLK_ENABLE()` 必须存在**——第二组在 PB 口，忘了开时钟则整个 Flash 组无信号，现象是"TF 卡正常、Flash 读到全 0xFF"；
-> ② **`GPIO_AF5_SPI1`**（SPI3 才是 AF6）。写错成 AF6 的典型现象是"烧录后一个器件都不响应"。
+> ① **`__HAL_RCC_GPIOB_CLK_ENABLE()` 必须存在**——Flash 的三根信号线都在 PB 口，忘了开时钟则 SCK/MOSI 完全没波形、MISO 读到恒定的 `0xFF`；
+> ② **`GPIO_AF5_SPI1`**（SPI3 才是 AF6）。写错成 AF6 的典型现象是"烧录后器件完全不响应"。
 
 ##### 知识点 5　新建用户驱动文件
 
@@ -1158,7 +1321,7 @@ SPI_Storage/
 
 | API | 作用 | 谁调用 |
 | --- | --- | --- |
-| `BUS_Init()` | 上电初始化（两路 CS 拉高、SPI1 切 328kHz） | `main()` |
+| `BUS_Init()` | 上电初始化（两路 CS 拉高、总线归于空闲，**不选中任何器件**） | `main()` |
 | `BUS_Select(BUS_DEV, prescaler)` | 选中一个器件并按需改变速率 | 两个驱动入口 |
 | `BUS_DeselectAll()` | 两路 CS 都拉高 | 切换时内部用 |
 | `BUS_ReadWriteByte(b)` | 单字节收发 | 两个驱动 |
@@ -1233,7 +1396,7 @@ void     BUS_ReadBytes(uint8_t *pData, uint16_t len);
 #endif /* __BSP_SPI1_BUS_H */
 ```
 
-> **8 根信号线在这份头文件里一次都没出现**——这是正确的：它们由 CubeMX 的 `spi.c` 一次性配成 AF5，**运行期谁都不该再碰它们**。本层只管两根 CS 和分频。
+> **信号线（PB3/PB4/PB5）在这份头文件里一次都没出现**——这是正确的：它们由 CubeMX 的 `spi.c` 一次性配成 AF5，**运行期谁都不该再碰它们**。本层只管片选和分频。
 
 ---
 
@@ -1274,9 +1437,15 @@ void BUS_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /* 以慢速启动（TF 卡初始化要求 ≤400kHz） */
+  /* ★ 初始化完成后只把总线"归于空闲"，不要顺手选中某个器件。
+   *
+   * 常见错误是这里写 BUS_Select(BUS_DEV_TF, BUS_SPEED_328K)：本意是
+   * "给 TF 卡准备好慢速环境"，但它同时把 PA4 拉低了——**上电就把一颗
+   * 器件选中**。此时 CPU 还在跑启动代码、没有时钟输出，那颗器件会一直
+   * 挂着等命令。正确做法是让 s_currentDev = BUS_DEV_NONE、两路 CS 都
+   * 为高，等各自的驱动在需要时自己去 BUS_Select。 */
   s_currentDev = BUS_DEV_NONE;
-  BUS_Select(BUS_DEV_TF, BUS_SPEED_328K);
+  BUS_DeselectAll();
 }
 
 /* ---------- 核心：选中器件 + 设定速率 ----------
@@ -1298,8 +1467,13 @@ void BUS_Select(BUS_DEV dev, uint32_t prescaler)
   if (prescaler != s_currentPrescaler)
   {
     __HAL_SPI_DISABLE(&hspi1);
-    hspi1.Init.BaudRatePrescaler = prescaler;
-    HAL_SPI_Init(&hspi1);          /* 内部会按 Init 内容重写 CR1 并重新使能 */
+    /* ★ 只改 BR 三位（CR1 的 bit5:3），不要在这里调 HAL_SPI_Init()。
+     *
+     * HAL_SPI_Init() 会用 WRITE_REG 整字重写 CR1，把除 PE 之外的配置
+     * 一起推倒重来，并把 hspi->State 从 BUSY 拉回 READY——如果此时一笔
+     * 传输正进行到一半（CS 已经拉低），SPI 状态机就被打断，后续字节
+     * 的时序会整体错位。直接改 BR 既安全又没有重初始化的开销。 */
+    MODIFY_REG(hspi1.Instance->CR1, SPI_CR1_BR, prescaler);
     __HAL_SPI_ENABLE(&hspi1);
     s_currentPrescaler = prescaler;
   }
@@ -1340,8 +1514,29 @@ void BUS_WriteBytes(uint8_t *pData, uint16_t len)
 
 void BUS_ReadBytes(uint8_t *pData, uint16_t len)
 {
-  /* SPI 读必须靠发 dummy 产生时钟，HAL_SPI_Receive 内部自动完成 */
-  HAL_SPI_Receive(&hspi1, pData, len, 1000);
+  /* ★ 用 TransmitReceive + dummy 逐字节读，不要用 HAL_SPI_Receive()。
+   *
+   * HAL_SPI_Receive() 在"主机 + 2 线全双工"下内部也会转调 TransmitReceive
+   * (把接收缓冲同时当发送源)，但它会先把 hspi->State 置成 BUSY_RX 再转调，
+   * 可读性和可控性都差；而且一旦某个字节超时，缓冲区里残留的内容不好判断。
+   * 这里显式地每读一个字节就送一个 0xFF，时钟来源一目了然，失败时也能
+   * 确定地填 0xFF。 */
+  uint8_t  dummy = 0xFF;
+  uint16_t i;
+
+  if ((pData == NULL) || (len == 0U))
+  {
+    return;
+  }
+
+  for (i = 0U; i < len; i++)
+  {
+    dummy = 0xFF;
+    if (HAL_SPI_TransmitReceive(&hspi1, &dummy, &pData[i], 1, 1000) != HAL_OK)
+    {
+      pData[i] = 0xFF;
+    }
+  }
 }
 ```
 
@@ -1361,15 +1556,27 @@ HAL_GPIO_WritePin(TF_CS_PORT, TF_CS_PIN, GPIO_PIN_RESET);   /* 假设此时 Flas
 
 **② 为什么改分频前要 `__HAL_SPI_DISABLE()`**
 
-SPI 的 `CR1` 在 `SPE = 1`（外设使能）时，**BR[2:0] 与 CPOL/CPHA 是只读的**。代码不会报错，但寄存器根本没变——**这是"改了分频没生效"的头号原因**。
+**准确的说法是**：`CPOL`、`CPHA`、`BR`、`DFF`、`LSBFIRST`、`MSTR`、`BIDIMODE` 这些配置位，**只有在 `SPE = 0`（外设关闭）时才保证写入生效**；当 `SPE = 1` 且总线上正在传输时改它们，硬件行为是未定义的（可能本次写入被忽略、也可能立即生效但把当前字节的时序打乱）。
+
+所以纪律是固定的：
+
+```
+① __HAL_SPI_DISABLE(&hspi1);    ← 先关 SPE
+② 改 CR1 里要改的位            ← 现在写才可靠
+③ __HAL_SPI_ENABLE(&hspi1);     ← 再开 SPE
+```
+
+> ⚠️ **顺带纠正一个流传很广的说法**："`SPE=1` 时 BR 位是只读的"——这不严谨。真正常见的失败原因是**你在 `SPE=1` 时整字重写了 CR1**，或者在传输中途改了配置，而不是某一位被硬件锁死。**记住"改配置先关外设"这条纪律就够了**，别去死记哪些位"只读"。
 
 **③ 为什么要缓存 `s_currentPrescaler`**
 
-因为 `HAL_SPI_Init()` 会重写整个 CR1 并重新使能外设，**有一定开销**。加上"速率没变就不动"的判断，连续读写同一器件时就不会反复重配。
+因为即使只改 BR 三位，也仍然要走一遍"关外设 → 改寄存器 → 开外设"，**外设重开会让当前帧的时钟短暂中断**。加上"速率没变就不动"的判断，连续读写同一器件时就不会反复关开外设。
+
+> ⚠️ **特别注意**：**不要为了改分频去调 `HAL_SPI_Init()`**。`HAL_SPI_Init()` 内部会用 `WRITE_REG` **整字重写 CR1**（`WRITE_REG(hspi->Instance->CR1, ...)`），把所有配置位一起推倒重来，还会把 `hspi->State` 从 `BUSY` 拉回 `READY`。**如果此时一笔传输正在进行（CS 已拉低），SPI 状态机就被打断，后续字节整体错位**——这是"偶发读错、重上电又好了"类玄学 bug 的常见来源。**改 BR 就只改 BR。**
 
 **④ 引脚去哪了**
 
-**根本没出现**。因为 `PA5/PA6/PA7/PB3/PB4/PB5` 在 CubeMX 生成的 `HAL_SPI_MspInit()` 里**一次性配成了 AF5 复用推挽**，之后**永远不会被改动**。这就是共享总线方案的简洁之处。
+**根本没出现**。因为 `PB3/PB4/PB5`（本工程只挂 Flash）在 CubeMX 生成的 `HAL_SPI_MspInit()` 里**一次性配成了 AF5 复用推挽**，之后**永远不会被改动**。这就是共享总线方案的简洁之处。
 
 #### 技能点 2　验证总线层
 
@@ -1448,19 +1655,22 @@ void BUS_SelfTest(void)
 | 1 | 直接拉低目标 CS，不先拉高另一根 | 两颗器件同时选中，MISO 电气打架 | **`BUS_Select()` 里先 `BUS_DeselectAll()`** |
 | 2 | 忘了 `__HAL_SPI_DISABLE()` 就改分频 | BR 位写不进去（只读保护），速率不变 | 改分频前必须 SPE=0 |
 | 3 | 忘记 `__HAL_RCC_GPIOB_CLK_ENABLE()` | Flash 组完全无信号，读到全 `0xFF` | 检查 MspInit 里有没有开 GPIOB 时钟 |
-| 4 | **照抄野火的模式 3 配置** | **TF 卡完全不响应**（CMD0 无应答） | **全总线统一模式 0**（CPOL=Low, CPHA=1Edge） |
+| 4 | **模式与本工程 `spi.c` 不一致** | 单挂 Flash 时两种都能跑；**加挂 TF 卡后模式 3 会让卡完全不响应** | **本工程单挂用模式 3；一旦共享总线就必须统一模式 0（CPOL=Low, CPHA=1Edge）** |
 
-##### 知识点 2　关于第 2 条：为什么改不了 CR1
+##### 知识点 2　关于第 2 条：为什么改分频前必须先关外设
 
-SPI 的 `CR1` 寄存器在 `SPE = 1`（外设使能）状态下，**大部分配置位被硬件锁定**：
+SPI 的 `CR1` 里有大量配置位，**这些位只有在 `SPE = 0`（外设关闭）时写入才可靠**：
 
-| 位 | SPE=0 | SPE=1 |
+| 位 | SPE=0（关外设） | SPE=1（已使能） |
 | --- | --- | --- |
-| CPOL / CPHA | 可写 | **只读** |
-| BR[2:0] | 可写 | **只读** |
-| DFF / LSBFIRST | 可写 | **只读** |
+| CPOL / CPHA | ✅ 写入必定生效 | ⚠️ 传输中改会打乱当前帧时序 |
+| BR[2:0] | ✅ 写入必定生效 | ⚠️ 传输中改，当前字节时钟周期突变 |
+| DFF / LSBFIRST | ✅ 写入必定生效 | ⚠️ 同上 |
+| SPE | 可写 | 可写（但别在传输中清） |
 
-> **这是"改了分频没生效"的头号原因**：代码没报错，返回值也是 `HAL_OK`，但寄存器根本没变。**只要记住"改 CR1 先关外设"，这类 bug 就绝迹了。**
+> **正确纪律只有一条**：**改任何配置位之前，先 `__HAL_SPI_DISABLE()`；改完再 `__HAL_SPI_ENABLE()`。**
+>
+> ⚠️ 另外纠正一个常见误解：网上常说"`SPE=1` 时 BR 位是只读的"——**这不准确**。硬件并不会把这些位锁死成只读；真正让你"改了没生效"的，通常是：① 传输途中改配置打乱了状态机；② 为了改分频去调 `HAL_SPI_Init()`，而它**整字重写 CR1**，把你之前设好的位全冲掉了。**记住"改配置先关外设"+"改 BR 就只改 BR"，这两个坑都能避开。**
 
 ---
 
@@ -1485,14 +1695,14 @@ SPI 的 `CR1` 寄存器在 `SPE = 1`（外设使能）状态下，**大部分配
 
 > **这就是"指令"二字的由来**：对主机（STM32）来说，它只是按 SPI 协议发出了几个字节；对从机（W25Q64）来说，这几个字节被解释成了**不同含义的操作**。
 
-##### 知识点 2　本项目必须掌握的九条指令
+##### 知识点 2　本项目必须掌握的十条指令
 
 **表 6-1 W25Q64 核心指令表**
 
 | 指令名 | 编码 | 后续字节 | 功能 | 本项目用在哪 |
 | --- | --- | --- | --- | --- |
-| Write Enable | `0x06` | 无 | **写使能**，置位 WEL | 每次擦/写前必发 |
-| Write Disable | `0x04` | 无 | 写禁止，清除 WEL | `W25Q64_PowerDown` 前 |
+| Write Enable | `0x06` | 无 | **写使能**，置位 WEL | 每次擦/写前必发（**独立一笔 CS 事务**） |
+| Write Disable | `0x04` | 无 | 写禁止，清除 WEL | 一般不用（每次擦写后 WEL 自动清零） |
 | Read Status Register | `0x05` | 回读 S7~S0 | 读状态寄存器（含 BUSY 位） | **忙等待** |
 | Read Data | `0x03` | A23~A0 + 数据流 | 读任意长度数据 | 读数据 |
 | Fast Read | `0x0B` | A23~A0 + 1 dummy + 数据 | 高速读（可到 104MHz） | 提速时用 |
@@ -1502,6 +1712,24 @@ SPI 的 `CR1` 寄存器在 `SPE = 1`（外设使能）状态下，**大部分配
 | Chip Erase | `0xC7` | 无 | 整片擦除（约 20s） | `W25Q64_ChipErase()` |
 | **JEDEC ID** | `0x9F` | 回读 3 字节 | 读厂商+容量 ID | **上电自检** |
 
+> ⚠️ **最容易写错的一条**：**`0x06`（写使能）必须自己独占一笔 CS 低-高事务**，不能和后面的擦除/编程命令挤在同一个 CS 低电平区间里。
+> ```c
+> /* ❌ 错误：CS 一直低，0x06 的"命令帧"没有结束，芯片不会置 WEL */
+> W25Q64_Enter();                     /* CS 拉低 */
+> W25Q64_SendByte(0x06);              /* 写使能 */
+> W25Q64_SendByte(0x20);              /* 扇区擦除 —— 被当成 0x06 的后续字节吞掉 */
+> W25Q64_SendAddr(addr);
+> BUS_DeselectAll();
+>
+> /* ✅ 正确：先完整结束写使能帧，再另起一笔事务发擦除命令 */
+> W25Q64_WriteEnable();               /* 内部：Enter → 发 0x06 → DeselectAll */
+> W25Q64_Enter();                     /* 重新拉低 CS，开始擦除帧 */
+> W25Q64_SendByte(0x20);
+> W25Q64_SendAddr(addr);
+> BUS_DeselectAll();
+> ```
+> **这个错误的可怕之处在于"不报错"**：写入命令被静默丢弃，读回来还是旧数据（或全 `0xFF`），你会怀疑是供电、焊接、时序，唯独想不到是 CS 帧没断开。
+
 **表 6-2 常用器件的 JEDEC ID**
 
 | 型号 | 厂商 ID（M7~M0） | 容量 ID（ID15~ID0） | 完整 24 位 ID |
@@ -1510,7 +1738,9 @@ SPI 的 `CR1` 寄存器在 `SPE = 1`（外设使能）状态下，**大部分配
 | W25Q128 | `0xEF` | `0x4018` | `0xEF4018` |
 | W25Q32 | `0xEF` | `0x4016` | `0xEF4016` |
 
-> ⚠️ **陷阱提醒**：野火第 24 章用的是 **W25Q128**，代码里宏定义写的是 `#define sFLASH_ID 0XEF4018`。**本项目是 W25Q64，必须改成 `0xEF4017`**。照抄野火代码却忘了改这一行，是"读 ID 校验失败"最常见的原因。
+> ⚠️ **陷阱提醒**：野火第 24 章的例程通常面向 **W25Q128**，代码里 ID 宏写的是 `0xEF4018`。**如果你手上是 W25Q64，必须用 `0xEF4017`**。照抄却忘了改这一行，是"读 ID 校验失败"最常见的原因。
+>
+> **更稳妥的做法**：初始化时**同时接受**若干同系列 ID（`0xEF4017` / `0xEF4016` / `0xEF4018`），只对 ID 全 `0xFF`、全 `0x00` 或厂商 ID 不是 `0xEF` 的情况报错。这样换料号不会导致整机"启动即失败"——**注意 `0xEF4018` 是 W25Q128（16MB），容量宏仍要按实际芯片改，否则越界访问会静默回卷。**
 
 #### 技能点 2　理解 NOR FLASH 的"擦写三定律"
 
@@ -1554,7 +1784,7 @@ SPI 的 `CR1` 寄存器在 `SPE = 1`（外设使能）状态下，**大部分配
 /* bsp_w25q64.h —— W25Q64（8MB SPI NOR FLASH）驱动接口
  *
  * 依赖：bsp_spi1_bus.h（SPI1 公共总线层）
- * 引脚：CS = PA15，CLK = PB3，SDO = PB4，SDI = PB5（信号线全部 AF5，模式 0）
+ * 引脚：CS = PA15，CLK = PB3，SDO = PB4，SDI = PB5（信号线全部 AF5，模式 3）
  *
  * 使用约定：
  *   1. 所有公开函数内部会自动 BUS_Select(BUS_DEV_FLASH)，无需调用者手动选片；
@@ -1663,8 +1893,10 @@ void     W25Q64_WakeUp(void);                           /* 唤醒 */
  * 所有公开函数都在入口处调用 BUS_Select() 选中 Flash，
  * 内部不直接操作 SPI1 的寄存器，也不关心引脚。
  *
- * ★ 注意：本驱动与 TF 卡共用 SPI1，全总线统一模式 0（CPOL=0, CPHA=1Edge）。
- *   野火例程用的是模式 3，照抄时务必把 CLKPolarity/CLKPhase 改成 Low / 1Edge。
+ * ★ 注意：本工程单挂 W25Q64，SPI1 用的是模式 3（CPOL=1, CPHA=2Edge），
+ *   实测读 ID 正常。W25Q64 同时支持模式 0 和模式 3。
+ *   一旦要把 TF 卡并联到同一条总线上，必须把 spi.c 里的
+ *   CLKPolarity/CLKPhase 改成 Low / 1Edge（模式 0），否则卡不响应。
  */
 #include "bsp_w25q64.h"
 #include <string.h>
@@ -1839,22 +2071,36 @@ uint16_t W25Q64_ReadDeviceID(void)
  */
 int W25Q64_SectorErase(uint32_t sectorAddr)
 {
+  int ret;
+
   if (sectorAddr >= W25Q64_FLASH_SIZE)
   {
     return W25Q64_ERR_PARAM;
   }
 
   /* 向下对齐到 4KB 边界：0x1234 → 0x1000 */
-  sectorAddr &= ~(W25Q64_SECTOR_SIZE - 1UL);
+  sectorAddr &= ~((uint32_t)W25Q64_SECTOR_SIZE - 1U);
 
+  /* ★ ① 先确认没有上一笔擦/写还在进行（这一句本身会完整地
+   *    "选中 → 发 0x05 → 轮询 → 取消选中"走一遍） */
+  ret = W25Q64_WaitForWriteEnd();
+  if (ret != W25Q64_OK)
+  {
+    return ret;
+  }
+
+  /* ★ ② 写使能必须是一笔"独立的、完整的" CS 低-高事务。
+   *    W25Q64_WriteEnable() 内部自己会 Enter + 发 0x06 + DeselectAll，
+   *    所以它前后都不要有人再手动拉 CS —— 否则 0x06 会被上一次
+   *    未结束的命令帧吞掉，芯片的 WEL 根本没置位，随后的擦除
+   *    命令会被静默丢弃（读回来还是原来的数据，不报错）。 */
+  W25Q64_WriteEnable();
+
+  /* ③ 现在才是擦除命令帧，单独一笔事务 */
   W25Q64_Enter();
-  W25Q64_WriteEnable();                 /* ① 写使能 */
-  if (W25Q64_WaitForWriteEnd() != W25Q64_OK) return W25Q64_ERR_TIMEOUT;
-
-  W25Q64_Enter();                       /* ② 指令 + 地址 */
   W25Q64_SendByte(W25X_SectorErase);
   W25Q64_SendAddr(sectorAddr);
-  BUS_DeselectAll();                    /* ③ 拉高，芯片开始擦 */
+  BUS_DeselectAll();                    /* 拉高，芯片开始擦 */
 
   return W25Q64_WaitForWriteEnd();      /* ④ 等擦完（最长 400ms） */
 }
@@ -1865,16 +2111,22 @@ int W25Q64_SectorErase(uint32_t sectorAddr)
  */
 int W25Q64_BlockErase(uint32_t blockAddr)
 {
+  int ret;
+
   if (blockAddr >= W25Q64_FLASH_SIZE)
   {
     return W25Q64_ERR_PARAM;
   }
 
-  blockAddr &= ~(W25Q64_BLOCK_SIZE - 1UL);   /* 对齐到 64KB */
+  blockAddr &= ~((uint32_t)W25Q64_BLOCK_SIZE - 1U);   /* 对齐到 64KB */
 
-  W25Q64_Enter();
-  W25Q64_WriteEnable();
-  if (W25Q64_WaitForWriteEnd() != W25Q64_OK) return W25Q64_ERR_TIMEOUT;
+  ret = W25Q64_WaitForWriteEnd();       /* 先确认上一次操作已结束 */
+  if (ret != W25Q64_OK)
+  {
+    return ret;
+  }
+
+  W25Q64_WriteEnable();                 /* 独立的写使能事务 */
 
   W25Q64_Enter();
   W25Q64_SendByte(W25X_BlockErase);
@@ -1890,9 +2142,15 @@ int W25Q64_BlockErase(uint32_t blockAddr)
  */
 int W25Q64_ChipErase(void)
 {
-  W25Q64_Enter();
+  int ret;
+
+  ret = W25Q64_WaitForWriteEnd();
+  if (ret != W25Q64_OK)
+  {
+    return ret;
+  }
+
   W25Q64_WriteEnable();
-  BUS_DeselectAll();
 
   W25Q64_Enter();
   W25Q64_SendByte(W25X_ChipErase);
@@ -1927,19 +2185,25 @@ int W25Q64_ChipErase(void)
  */
 static int W25Q64_PageWrite(uint32_t addr, uint8_t *pData, uint16_t len)
 {
-  if (len == 0 || len > W25Q64_PAGE_SIZE)
+  int ret;
+
+  if ((len == 0U) || (len > W25Q64_PAGE_SIZE))
   {
     return W25Q64_ERR_PARAM;
   }
 
-  W25Q64_Enter();
-  W25Q64_WriteEnable();                     /* 写使能 */
-  BUS_DeselectAll();
+  ret = W25Q64_WaitForWriteEnd();       /* 先确认上一次操作已结束 */
+  if (ret != W25Q64_OK)
+  {
+    return ret;
+  }
 
-  W25Q64_Enter();
-  W25Q64_SendByte(W25X_PageProgram);        /* 0x02 */
+  W25Q64_WriteEnable();                 /* ★ 独立的写使能事务，内部自带 CS 拉高 */
+
+  W25Q64_Enter();                       /* ★ 重新拉低 CS，开始页编程命令帧 */
+  W25Q64_SendByte(W25X_PageProgram);    /* 0x02 */
   W25Q64_SendAddr(addr);
-  W25Q64_SendBytes(pData, len);             /* 一次发完，芯片内部地址自增 */
+  W25Q64_SendBytes(pData, len);         /* 一次发完，芯片内部地址自增 */
   BUS_DeselectAll();
 
   return W25Q64_WaitForWriteEnd();          /* 等页编程完成（约 0.7ms） */
@@ -2023,7 +2287,9 @@ int W25Q64_WriteBuffer(uint32_t addr, uint8_t *pData, uint32_t len)
  */
 int W25Q64_ReadBuffer(uint32_t addr, uint8_t *pData, uint32_t len)
 {
-  if (pData == NULL || len == 0)
+  uint32_t chunk;
+
+  if (pData == NULL || len == 0U)
   {
     return W25Q64_ERR_PARAM;
   }
@@ -2035,14 +2301,27 @@ int W25Q64_ReadBuffer(uint32_t addr, uint8_t *pData, uint32_t len)
   W25Q64_Enter();
   W25Q64_SendByte(W25X_ReadData);      /* 0x03 */
   W25Q64_SendAddr(addr);
-  W25Q64_RecvBytes(pData, (uint16_t)len);
+
+  /* ★ 分块发送 dummy 时钟。总线层的 BUS_ReadBytes() 的 len 参数是
+   *   uint16_t，如果直接把大于 65535 的 len 强转过去，会被静默截断
+   *   （例如 len=100000 只剩 34464），读到一半就停、后半段全是旧值。
+   *   这里按 0xFFFF 分块，任意长度都正确。 */
+  while (len > 0U)
+  {
+    chunk = (len > 0xFFFFU) ? 0xFFFFU : len;
+    W25Q64_RecvBytes(pData, (uint16_t)chunk);
+    pData += chunk;
+    addr  += chunk;
+    len   -= chunk;
+  }
+
   BUS_DeselectAll();
 
   return W25Q64_OK;
 }
 ```
 
-> **注意 `(uint16_t)len` 的类型转换**：`BUS_ReadBytes()` 的参数是 `uint16_t`，如果一次读超过 65535 字节，会被截断。**本项目的 `ReadBuffer` 限制在 64KB 以内**。
+> **注意 `(uint16_t)chunk` 的类型转换**：`BUS_ReadBytes()` 的参数是 `uint16_t`，单次最多 65535 字节。上面的实现按 `0xFFFF` 分块循环，**任意长度都正确**——但如果你偷懒写成 `W25Q64_RecvBytes(pData, (uint16_t)len)` 直接强转，一旦 `len > 65535` 就会被静默截断，读到一半就停、后半段还是缓冲区里的旧值。**这种 bug 只在"读超过 64KB"时才暴露，小数据测试永远发现不了。**
 
 ##### 知识点 2　擦写一体化与空白检测
 
@@ -2055,17 +2334,24 @@ int W25Q64_ReadBuffer(uint32_t addr, uint8_t *pData, uint32_t len)
 int W25Q64_EraseAndWrite(uint32_t addr, uint8_t *pData, uint32_t len)
 {
   uint32_t startSector, endSector, sec;
+  int      ret;
 
-  if (pData == NULL || len == 0)          return W25Q64_ERR_PARAM;
-  if (addr + len > W25Q64_FLASH_SIZE)     return W25Q64_ERR_PARAM;
+  if (pData == NULL || len == 0U)          return W25Q64_ERR_PARAM;
+
+  /* ★ 先判 addr 本身越界，再判 addr+len。顺序不能反：
+   *   若 addr 已接近 0xFFFFFFFF，addr+len 会发生 32 位无符号回绕，
+   *   变成一个很小的值，于是 "addr+len > FLASH_SIZE" 反而判为 false，
+   *   越界检查被绕过。先卡 addr 就能杜绝这种回绕。 */
+  if (addr >= W25Q64_FLASH_SIZE)           return W25Q64_ERR_PARAM;
+  if (len > (W25Q64_FLASH_SIZE - addr))    return W25Q64_ERR_PARAM;
 
   startSector = addr / W25Q64_SECTOR_SIZE;
-  endSector   = (addr + len - 1) / W25Q64_SECTOR_SIZE;
+  endSector   = (addr + len - 1U) / W25Q64_SECTOR_SIZE;
 
   /* 逐个扇区擦除 */
   for (sec = startSector; sec <= endSector; sec++)
   {
-    int ret = W25Q64_SectorErase(sec * W25Q64_SECTOR_SIZE);
+    ret = W25Q64_SectorErase(sec * W25Q64_SECTOR_SIZE);
     if (ret != W25Q64_OK) return ret;
   }
 
@@ -2081,17 +2367,19 @@ int W25Q64_IsBlank(uint32_t addr, uint32_t len)
   uint8_t  buf[64];
   uint32_t i, n;
 
-  if (addr + len > W25Q64_FLASH_SIZE) return -1;
+  /* 同 EraseAndWrite：先卡 addr，再判剩余长度，避免 32 位回绕 */
+  if (addr >= W25Q64_FLASH_SIZE)        return -1;
+  if (len > (W25Q64_FLASH_SIZE - addr)) return -1;
 
-  while (len > 0)
+  while (len > 0U)
   {
     n = (len > sizeof(buf)) ? sizeof(buf) : len;
 
     if (W25Q64_ReadBuffer(addr, buf, n) != W25Q64_OK) return -1;
 
-    for (i = 0; i < n; i++)
+    for (i = 0U; i < n; i++)
     {
-      if (buf[i] != 0xFF) return 0;      /* 找到非 0xFF，说明有数据 */
+      if (buf[i] != 0xFFU) return 0;      /* 找到非 0xFF，说明有数据 */
     }
 
     addr += n;
@@ -2140,47 +2428,61 @@ void W25Q64_WakeUp(void)
 /**
  * @brief  W25Q64 初始化与自检
  * @retval W25Q64_OK / W25Q64_ERR_ID
- * @note   内部会通过总线层选中 Flash（PA15 拉低、PA4 拉高、21MHz、模式 0）
+ * @note   内部会通过总线层选中 Flash（PA15 拉低、21MHz、模式 3）
  */
 int W25Q64_Init(void)
 {
   uint32_t id;
+  uint8_t  status;
 
-  BUS_Select(BUS_DEV_FLASH, BUS_SPEED_21M);   /* 选中 Flash */
+  /* 先让总线归于空闲，再给芯片上电稳定时间（tPUW 典型 5ms） */
   BUS_DeselectAll();
-  HAL_Delay(5);                                /* 上电稳定（tPUW 典型 5ms） */
+  HAL_Delay(5);
 
   id = W25Q64_ReadID();
   printf("[W25Q64] JEDEC ID = 0x%06lX\r\n", (unsigned long)id);
 
+  /* ★ 顺手把状态寄存器打出来：bit0(BUSY)、bit1(WEL) 以及块保护位
+   *   一眼可见。块保护位若被置位，写入会被静默丢弃——这是
+   *   "ID 正常但写不进去"的常见原因之一。 */
+  status = W25Q64_ReadStatus();
+  printf("[W25Q64] Status   = 0x%02X\r\n", (unsigned int)status);
+
   if (id == W25Q64_JEDEC_ID)
   {
-    printf("[W25Q64] 检测到 W25Q64（8MB），自检通过\r\n");
+    printf("[W25Q64] Init OK\r\n");
     return W25Q64_OK;
   }
-  else if (id == 0xEF4018UL)
+
+  /* 同系列更大/更小的料号：命令集一致，测试地址仍然安全，继续跑 */
+  if ((id == 0xEF4018UL) || (id == 0xEF4016UL))
   {
-    printf("[W25Q64] 警告：实际是 W25Q128（16MB），请修改 W25Q64_JEDEC_ID 宏\r\n");
+    printf("[W25Q64] Compatible device 0x%06lX detected, continuing\r\n",
+           (unsigned long)id);
+    return W25Q64_OK;
   }
-  else if (id == 0xFFFFFFUL)
+
+  if (id == 0xFFFFFFUL)
   {
-    printf("[W25Q64] 错误：ID 全为 0xFF —— MISO 悬空/无供电/CS 未拉低\r\n");
-    printf("         检查：① 3.3V 供电 ② PB4(SDO) 焊接 ③ PB3/PB4 是否已释放 JTAG\r\n");
-    printf("         ④ HAL_SPI_MspInit 里有没有 __HAL_RCC_GPIOB_CLK_ENABLE()\r\n");
+    printf("[W25Q64] No response (MISO stuck high). Check wiring:\r\n");
+    printf("[W25Q64]   CS=PA15  SCK=PB3  MISO=PB4  MOSI=PB5  VCC=3.3V  GND\r\n");
+    printf("[W25Q64]   Also check that PB3/PB4 are not held by a JTAG debugger.\r\n");
+    return W25Q64_ERR_ID;
   }
-  else if (id == 0x000000UL)
+
+  if (id == 0x000000UL)
   {
-    printf("[W25Q64] 错误：ID 全为 0x00 —— MISO 短地/数据线接反\r\n");
+    printf("[W25Q64] No response (MISO stuck low). Check GND and MISO wiring.\r\n");
+    return W25Q64_ERR_ID;
   }
-  else
-  {
-    printf("[W25Q64] 错误：ID 不匹配（读到 0x%06lX，期望 0x%06lX）\r\n",
-           (unsigned long)id, (unsigned long)W25Q64_JEDEC_ID);
-    printf("         若读到的值'像但不完全像'，多半是 CPOL/CPHA 模式不对\r\n");
-  }
+
+  printf("[W25Q64] Unexpected ID 0x%06lX (expected 0x%06lX)\r\n",
+         (unsigned long)id, (unsigned long)W25Q64_JEDEC_ID);
   return W25Q64_ERR_ID;
 }
 ```
+
+> **为什么这里还要打印 `Status`**：只打印 ID 只能证明"时钟通、MISO 通、模式对"。**状态寄存器能进一步告诉你芯片是不是处于写保护**（BP 位被置 1 时，擦除和编程会被静默丢弃，不发任何错误）。**两个值一起看，故障范围立刻缩小一半。**
 
 ##### 知识点 2　ID 校验的诊断表
 
@@ -2244,7 +2546,7 @@ static int BufferCompare(uint8_t *a, uint8_t *b, uint32_t len)
     if (a[i] != b[i])
     {
       printf("[校验失败] 第 %lu 字节：写入 0x%02X，读出 0x%02X\r\n",
-             (unsigned long)i, a[i], b[i]);
+             (unsigned long)i, (unsigned int)a[i], (unsigned int)b[i]);
       return -1;
     }
   }
@@ -2304,7 +2606,15 @@ void W25Q64_Test(void)
   if (BufferCompare(s_txBuf, s_rxBuf, FLASH_TEST_LEN) == 0)
   {
     printf("★ 回环校验通过：写入与读出完全一致\r\n");
-    printf("  读出前 32 字节：%.32s\r\n", s_rxBuf);
+    /* ★ 别用 "%s" 或 "%.32s" 打印测试缓冲区！
+     *   BuildTestData() 后 128 字节是 0x00~0x7F 的二进制递增，
+     *   里面含 0x00 —— printf 会在第一个 0x00 处截断，甚至越界读。
+     *   要"肉眼可读"就只打印前 32 个 ASCII 字符，或者按十六进制打。 */
+    printf("  读出前 32 字节（ASCII）：%c%c%c%c%c%c%c%c%c%c%c%c%c%c%c%c\r\n",
+           s_rxBuf[0],  s_rxBuf[1],  s_rxBuf[2],  s_rxBuf[3],
+           s_rxBuf[4],  s_rxBuf[5],  s_rxBuf[6],  s_rxBuf[7],
+           s_rxBuf[8],  s_rxBuf[9],  s_rxBuf[10], s_rxBuf[11],
+           s_rxBuf[12], s_rxBuf[13], s_rxBuf[14], s_rxBuf[15]);
   }
   else
   {
@@ -2485,11 +2795,11 @@ void W25Q64_TestFullSector(void)
 ##### 知识点 1　四个必须看的位置
 
 1. **CS（PA15）**：每次命令是否是"一次干净的低-高"？
-2. **SCK（PB3）**：空闲时是否是**低电平**（模式 0 的标志）？有无 8 个完整周期的突发？
+2. **SCK（PB3）**：看空闲电平和模式是否匹配——**模式 3 空闲为高电平，模式 0 空闲为低电平**。本工程是模式 3，所以**空闲时 SCK 应该是高**。同时确认每传一个字节有 8 个完整时钟周期。
 3. **MOSI（PB5）**：第一个字节是否是 `0x9F`（读 ID 时）？MSB 是否在前？
 4. **MISO（PB4）**：是否有数据随 SCK 变化（而不是一根直线）？
 
-> **注意本项目看的是模式 0**：SCK 空闲时**低电平**。如果你看到空闲高，那就是配成了模式 3，**TF 卡一定不工作**。
+> **本工程看的是模式 3**：SCK **空闲时高电平**，数据在**第二个边沿（下降沿之后的上升沿）**采样。如果你看到空闲低，那是模式 0——**对单挂 W25Q64 同样能工作，但和代码里的 `spi.c` 配置不一致，说明你改过 CubeMX 却没重新生成代码**。
 
 ##### 知识点 2　用 GPIO 打点测时序
 
@@ -3361,7 +3671,7 @@ int main(void)
   HAL_Init();
   SystemClock_Config();          /* 168MHz：PCLK2 = 84MHz（SPI1 时钟源） */
   MX_GPIO_Init();                /* PA4 / PA15 两路片选 */
-  MX_SPI1_Init();                /* SPI1：模式 0、8 位、÷256（初值） */
+  MX_SPI1_Init();                /* SPI1：模式 3、8 位、÷2（本工程初值） */
   MX_USART1_UART_Init();         /* 115200-8-N-1 */
 
   printf("\r\n========== SPI 存储项目启动 ==========\r\n");
@@ -3487,7 +3797,7 @@ void DualDeviceStressTest(void)
 | `BUS_Select` 的 CS 引脚写反 | Flash 正常，TF 卡全错 | TF/Flash 的 CS 引脚对应关系颠倒 |
 | 切换时漏了 `BUS_DeselectAll()` | 偶发读到另一颗的数据 | 两颗器件同时被选中 |
 | 忘了 `__HAL_SPI_DISABLE` | 速率没变，第二颗器件时序出错 | CR1 在 SPE=1 时只读 |
-| 模式配成了 3 | Flash 正常，**TF 卡完全不动** | TF 卡只支持模式 0 |
+| 模式配成了 3 | Flash 正常，**TF 卡完全不动** | TF 卡只支持模式 0（单挂 Flash 时模式 3 无碍） |
 
 ---
 
@@ -3583,7 +3893,7 @@ SPI_Storage/
 | 序号 | 验收项 | 通过标准 | 关联任务 |
 | --- | --- | --- | --- |
 | 1 | CubeMX 无引脚冲突警告 | 生成时无黄色/红色告警 | 任务四 |
-| 2 | **8 根信号线全部是 AF5** | `spi.c` 中 PA5/6/7 与 PB3/4/5 均为 `GPIO_AF5_SPI1` | 任务四 |
+| 2 | **信号线全部是 AF5** | `spi.c` 中 PB3/4/5（及挂 TF 卡时的 PA5/6/7）均为 `GPIO_AF5_SPI1` | 任务四 |
 | 3 | **`__HAL_RCC_GPIOB_CLK_ENABLE()` 存在** | MspInit 里有这一行 | 任务四 |
 | 4 | 工程编译 0 错误 0 警告 | 编译器输出 | 任务四 |
 | 5 | 调试器能连接、能单步 | Keil/CubeIDE 正常下载调试 | 任务一 |
@@ -3657,8 +3967,8 @@ SPI_Storage/
 
 每一条打印都对应一个**可独立判定的检查点**：
 
-- `[总线] Flash 读到 ID = EF 40 17` → **片选 PA15 有效、AF5 正确、模式 0 正确**；
-- `[总线] TF 卡读到 R1 = 01` → **片选 PA4 有效、模式 0 正确**；
+- `[总线] Flash 读到 ID = EF 40 17` → **片选 PA15 有效、AF5 正确、SPI 模式配对了**；
+- `[总线] TF 卡读到 R1 = 01` → **片选 PA4 有效、SPI 模式与卡匹配**；
 - `[TF] CMD8 响应正常` → SD 协议栈第一步成功；
 - `[TF] 高容量卡（SDHC）` → CMD58 读到了 OCR，寻址方式确定；
 - `★ 20 轮交替读写全部通过` → **共享总线真正经受住了考核**。
@@ -3679,7 +3989,7 @@ SPI_Storage/
 
 ```
 物理层（四根线）
-    → 协议层（CPOL/CPHA，本项目统一模式 0）
+    → 协议层（CPOL/CPHA；本工程单挂 Flash 用模式 3，共享总线时必须模式 0）
         → 外设层（CR1/SR/HAL API）
             → 片选层（两路 CS 互斥 ← 本项目核心）
                 → 器件层（W25Q64 指令 / TF 卡 CMD 状态机）
@@ -3687,7 +3997,7 @@ SPI_Storage/
                         → 应用层（测试、日志、文件系统）
 ```
 
-**每往上一层，屏蔽的细节就多一层**：应用层调 `W25Q64_ReadBuffer()` 时，完全不用知道底下是 SPI1、是 AF5、是模式 0、是 21MHz。**分层不是为了好看，是为了"出问题时你能快速定位到哪一层"**：
+**每往上一层，屏蔽的细节就多一层**：应用层调 `W25Q64_ReadBuffer()` 时，完全不用知道底下是 SPI1、是 AF5、是模式 3、是 21MHz。**分层不是为了好看，是为了"出问题时你能快速定位到哪一层"**：
 
 - ID 读不到 → 看**片选层及以下**（CS、AF5、模式）；
 - ID 能读但写不进 → 看**器件层**（写使能、擦除、忙等待）；
@@ -3704,7 +4014,7 @@ SPI_Storage/
    引脚不用切、模式不用切，但要保证**任何时候只有一根 CS 为低**。`BUS_Select()` 里"先全断、后单选"的写法就是这条原则的落地。
 
 3. **共享总线会强制两个器件"统一参数"**
-   模式取交集（模式 0）、速率取交集（21MHz）。**设计阶段就要把两个器件的手册参数摆在一起比**，否则写到一半才发现冲突，返工代价很大。
+   模式取交集、速率取交集（21MHz）。**本工程只挂 Flash 时可以自由选模式；一旦加挂 TF 卡，模式就只能取交集的模式 0。** 设计阶段就要把两个器件的手册参数摆在一起比，否则写到一半才发现冲突，返工代价很大。
 
 #### 技能点 3　延伸方向
 
@@ -3750,7 +4060,7 @@ SPI_Storage/
 
 2. **共享总线的原理是"三线并联 + 片选互斥"**：SCK/MOSI/MISO 三根线并联共用，**没被选中的器件会把 MISO 置为高阻并忽略时钟**，因此同一时刻只要只有一根 CS 为低，就不会冲突。**不需要切换引脚，也不需要分时复用。**
 
-3. **共享总线的硬约束：两个器件必须用同一个 SPI 模式**。TF 卡只支持模式 0，所以**全总线统一模式 0（CPOL=Low, CPHA=1Edge）**。W25Q64 也支持模式 0，可以直接用。**野火例程用的是模式 3，照抄必须改这两行。**
+3. **共享总线的硬约束：两个器件必须用同一个 SPI 模式**。TF 卡只支持模式 0，所以**一旦共享总线就必须统一模式 0（CPOL=Low, CPHA=1Edge）**。W25Q64 支持模式 0 和模式 3，**本工程单挂 Flash 时用的是模式 3，也能正常工作；加挂 TF 卡时才需要改这两行。**
 
 4. **PA15/PB3/PB4 复位后是 JTAG 引脚**，必须在 CubeMX 的 SYS 里把 Debug 选成 **Serial Wire**（不能选 JTAG，也不能选 Trace Asynchronous Sw）。
 
@@ -3776,14 +4086,14 @@ SPI_Storage/
 | --- | --- | --- | --- |
 | CubeMX 里 PB3/PB4/PA15 点不亮 | SYS 的 Debug 选了 JTAG 或 Trace Async Sw | 看 System Core → SYS | 改选 **Serial Wire** |
 | CubeMX 里 PB3 选不到 SPI1_SCK | 同上，被 JTAG 占用 | 看 SYS 设置 | 先释放 JTAG，再选 SPI1 |
-| **TF 卡完全不动，Flash 正常** | **SPI 配成了模式 3** | 看 `spi.c` 的 `CLKPolarity` | **改成 `SPI_POLARITY_LOW` + `SPI_PHASE_1EDGE`** |
+| **TF 卡完全不动，Flash 正常** | 共享总线上**模式配成了 3**（TF 卡只支持模式 0） | 看 `spi.c` 的 `CLKPolarity` | 改成 `SPI_POLARITY_LOW` + `SPI_PHASE_1EDGE` |
 | **Flash 全错，TF 卡正常** | ① GPIOB 时钟没开 ② PB3/PB4 被 JTAG 占 | 看 `HAL_SPI_MspInit` | 补 `__HAL_RCC_GPIOB_CLK_ENABLE()`；释放 JTAG |
 | 编译通过但两器件都不响应 | **AF 写成 AF6** | 看 `spi.c` 的 `GPIO_AF5_SPI1` | SPI1 必须是 **AF5** |
 | **改了分频没生效** | **SPE=1 时 CR1 只读** | 看是否先 `__HAL_SPI_DISABLE()` | 改 CR1 前必须关外设 |
 | 交替读写偶发失败 | 两颗器件同时被选中 | 示波器看 PA4/PA15 是否同时为低 | `BUS_Select()` 里先 `BUS_DeselectAll()` |
 | W25Q64 读 ID = `0xFFFFFF` | MISO 悬空/无供电/CS 没拉低 | 量 VCC、PB4、PA15 | 查焊接与 GPIOB 时钟 |
 | W25Q64 读 ID = `0xEF4018` | 焊的是 W25Q128 | 看芯片丝印 | 改 `W25Q64_JEDEC_ID` 宏 |
-| W25Q64 读 ID "半对" | CPOL/CPHA 不匹配 | 检查是否误用模式 3 | 改成模式 0 |
+| W25Q64 读 ID "半对" | CPOL/CPHA 不匹配 | 单挂 Flash 时换另一个模式试 | 模式 0 ↔ 模式 3 互换验证 |
 | W25Q64 写不进、读回全 `0xFF` | ① 忘写使能 ② 忘等 BUSY ③ 未擦除 ④ `WP#` 悬空 | 逐条对照 | 补齐四步；`WP#` 上拉 10kΩ |
 | W25Q64 前几字节对、后面错 | 跨页回卷 | 跑跨页测试 | 检查 `pageRemain` 计算 |
 | 程序卡死无输出 | SPI 超时用了 `HAL_MAX_DELAY` | 看 API 的 Timeout 参数 | 改成 100ms |
@@ -3805,12 +4115,13 @@ SPI_Storage/
 | --- | --- | --- |
 | 系统时钟 | SYSCLK / HCLK | 168 MHz |
 | **SPI1 时钟源** | **PCLK2（APB2）** | **84 MHz** |
-| 复用编号 | **SPI1（两组引脚都是）** | **AF5** |
-| **TF-CARD 引脚** | CS / CLK / MISO / MOSI | **PA4 / PA5 / PA6 / PA7** |
+| 复用编号 | **SPI1 信号线** | **AF5**（SPI3 才是 AF6） |
+| **TF-CARD 引脚** | CS / CLK / MISO / MOSI | **PA4 / PA5 / PA6 / PA7**（加挂 TF 卡时才启用） |
 | **Flash 引脚** | CS / CLK / MISO(SDO) / MOSI(SDI) | **PA15 / PB3 / PB4 / PB5** |
-| **SPI 模式** | CPOL / CPHA（两器件共用） | **0 / 0 → Low / 1 Edge（模式 0）** |
+| **SPI 模式** | CPOL / CPHA | **1 / 1 → High / 2 Edge（模式 3，本工程实配）**；共享总线需改 **0 / 0 → Low / 1 Edge** |
 | 数据帧 / 位序 | — | 8 位 / MSB 先行 |
-| FLASH 速率 | 分频 / SCK | ÷4 / **21 MHz** |
+| FLASH 速率 | 分频 / SCK | ÷4 / **21 MHz**（总线层运行期设定） |
+| SPI1 初值分频 | `spi.c` 生成值 | ÷2 / **42 MHz**（`SPI_BAUDRATEPRESCALER_2`） |
 | TF 卡速率 | 分频 / SCK | ÷256→**328 kHz**（初始化）、÷4→**21 MHz**（运行） |
 | W25Q64 | JEDEC ID / 容量 | **0xEF4017** / 8 MB |
 | W25Q64 | 页 / 扇区 / 块 | 256 B / 4 KB / 64 KB |
